@@ -1,0 +1,28 @@
+# PATHS
+# When starting to use WI-CAFO, create a copy of this file, rename it 'config.yml', and 
+# replace the paths below with the respective directories on your computer.
+
+# project directory
+project_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo
+
+# directory that contains raw data for analysis
+data_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/data
+
+# where to save figures
+fig_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/figures
+
+# where to save analysis outputs
+analysis_output_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/analysis_outputs
+
+# where cluster outputs are located
+cluster_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/analysis_outputs/clusters
+
+# where land parcel data is located
+land_parcel_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/data/land_parcels
+
+# where model prediction polygons are located
+model_prediction_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/data/model_predictions
+
+# Path to GCP credentials file. For more information on creating a credentials file linked to your google
+# account, see https://cloud.google.com/docs/authentication/provide-credentials-adc.
+gcp_cred_path: '/Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/config/law-cafo-b8d0ee1e9422.json'

@@ -1,0 +1,15 @@
+config/config.yml
+*.json
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+figures/
+paper_results/
+analysis_outputs/
+data/
+*.feather
+*.gdb/
+wicafo/
+.venv/
+*.egg-info/
