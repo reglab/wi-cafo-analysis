@@ -77,12 +77,12 @@ def prep_permit_data(data_path, use_only_dairy_permits=True):
 
     return permit_data
 
-def prep_model_error_data(cluster_path = Path(cfg.project_path + "/analysis_outputs/Clusters"),
-                          annotated_ims_path = Path(cfg.project_path + "/data/Annotations/all_labeled_images.csv"),
+def prep_model_error_data(cluster_path = Path(cfg.cluster_path),
+                          annotated_ims_path = Path(cfg.data_path + "/data/Annotations/all_labeled_images.csv"),
                           size_bins = cfg.size_bins,
                           model_type = "four_band",
                           how='left'):
-    all_cf_clusters = cluster.load_clusters(cluster_path / "all_CF_clusters.csv")
+    all_cf_clusters = cluster.load_clusters(cluster_path / "all_cf_clusters.csv")
     three_band_clusters = cluster.load_clusters(
             cluster_path / "three_band_clusters.csv"
         )
@@ -211,8 +211,8 @@ def sample_and_calc_au(
     cluster_data["Dairy_count_estimate_upper"] = 0
     
     # Get error data
-    error_data = prep_model_error_data(cluster_path = Path(cfg.project_path + "/analysis_outputs/Clusters"),
-                          annotated_ims_path = Path(cfg.project_path + "/data/Annotations/all_labeled_images.csv"),
+    error_data = prep_model_error_data(cluster_path = Path(cfg.cluster_path),   
+                          annotated_ims_path = Path(cfg.data_path + "/annotations/all_labeled_images.csv"),
                           size_bins = size_bins,
                           model_type = model_type,
                           how=model_error_join)
@@ -483,7 +483,7 @@ if __name__ == '__main__':
     cluster_path = Path(configs["cluster_path"])
 
     #  Load all CF annotation clusters statewide
-    all_cf_clusters = cluster.load_clusters(cluster_path / "all_CF_clusters.csv")
+    all_cf_clusters = cluster.load_clusters(cluster_path / "all_cf_clusters.csv")
 
     # Load pre-created three- and four-band model clusters
     four_band_clusters = cluster.load_clusters(cluster_path / "four_band_clusters.csv")

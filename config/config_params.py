@@ -13,11 +13,33 @@ import yaml
 #     configs = yaml.safe_load(file)
 #     project_path = configs["project_path"]
 
-project_path = "/Users/mihirb/gitclones/afo_vs_cafo"
+project_path = "/Users/mihirb/gitclones/wi-cafo-analysis"
+
+# directory that contains raw data for analysis
+data_path = "/Users/mihirb/gitclones/wi-cafo-analysis/data/input_data"
+
+# where to save figures
+fig_path = "/Users/mihirb/gitclones/wi-cafo-analysis/figures"
+
+# where to save analysis outputs
+analysis_output_path = "/Users/mihirb/gitclones/wi-cafo-analysis/analysis_outputs"
+
+# where cluster outputs are located
+cluster_path = "/Users/mihirb/gitclones/wi-cafo-analysis/data/input_data/clusters"
+
+# where land parcel data is located
+land_parcel_path = "/Users/mihirb/gitclones/wi-cafo-analysis/data/land_parcels"
+
+# where model prediction polygons are located
+model_prediction_path = "/Users/mihirb/gitclones/wi-cafo-analysis/data/model_predictions"
+
+# Path to GCP credentials file. For more information on creating a credentials file linked to your google
+# account, see https://cloud.google.com/docs/authentication/provide-credentials-adc.
+gcp_cred_path = "/Users/mihirb/gitclones/law-cafo-gcloud-key.json"
 
 
 animal_count_permit_data_path = (
-    project_path + "/data/permit_animal_type_records_5.14.25.csv"
+    project_path + "/data/input_data/permit_animal_type_records.csv"
 )
 # Geographic constants
 #####################

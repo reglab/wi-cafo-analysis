@@ -2651,7 +2651,7 @@ def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, m
     image_bound_map = gpd.read_file(analysis_output_path / "image_bound_map.geojson")
     # Load county boundary shapefile
     counties = gpd.read_file(
-        data_path / "County_Boundaries_24K/County_Boundaries_24K.shp"
+        data_path / "geospatial/county_boundaries/County_Boundaries_24K.shp"
     )
     counties["train_counties"] = counties["COUNTY_NAM"].isin(cfg.EWG_COUNTIES)
     # Load land parcels
@@ -2678,26 +2678,26 @@ def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, m
 
     # Load known CAFO locations
     WDNR_CAFOs = gpd.read_file(
-        data_path / "WDNR_permitted_CAFOs/WDNR_CAFOs.geojson", driver="GeoJSON", crs=cfg.WI_EPSG
+        data_path / "WDNR_CAFOs.geojson", driver="GeoJSON", crs=cfg.WI_EPSG
     )
     if not WDNR_CAFOs.sindex:
         WDNR_CAFOs.sindex
 
     # Load EWG AFO location predictions
     ewg_afos = gpd.read_file(
-        data_path / "ewg_AFOs_012022.geojson.txt", driver="GeoJSON"
+        data_path / "ewg_AFOs_012022.geojson", driver="GeoJSON"
     )
     ewg_afos.to_crs(cfg.WI_EPSG, inplace=True)
 
     # Load all CF annotations outside EWG study region
     cf_annotations_exc_EWG = cluster.load_polygons(
-        data_path / "Annotations/full_state_cf_annotations.geojson",
+        data_path / "annotations/full_state_cf_annotations.geojson",
         counties,
         image_bound_map,
     )
 
     # Load all CF annotation clusters statewide
-    all_cf_clusters = cluster.load_clusters(cluster_path / "all_CF_clusters.csv")
+    all_cf_clusters = cluster.load_clusters(cluster_path / "all_cf_clusters.csv")
     if "animal_unit_estimate" not in all_cf_clusters.columns:
         all_cf_clusters = est_au.sample_and_calc_au(
             all_cf_clusters, include_area_uncertainty=False
@@ -2735,13 +2735,13 @@ def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, m
     ]
 
     all_waters = gpd.read_file(
-        data_path / "water_data" / "24k_Hydro_Waterbodies_(Open_Water).geojson"
+        data_path / "geospatial/water_data" / "24k_Hydro_Waterbodies_(Open_Water).geojson"
     ).to_crs(cfg.WI_EPSG)
     impaired_lakes = gpd.read_file(
-        data_path / "water_data" / "impaired_lakes.geojson"
+        data_path / "geospatial/water_data" / "impaired_lakes.geojson"
     ).to_crs(cfg.WI_EPSG)
     impaired_rivers_streams = gpd.read_file(
-        data_path / "water_data" / "impaired_rivers_streams.geojson"
+        data_path / "geospatial/water_data" / "impaired_rivers_streams.geojson"
     ).to_crs(cfg.WI_EPSG)
     impaired_waters = gpd.GeoDataFrame(
         pd.concat([impaired_lakes, impaired_rivers_streams], ignore_index=True)
@@ -2751,7 +2751,7 @@ def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, m
         impaired_waters["ALL_SOURCES"] == "Non-Point Source (Rural or Urban)"
     ]
     water_table_depth = gpd.read_file(
-        data_path / "water_data" / "GCSM_-_Water_Table_Depth.geojson"
+        data_path / "geospatial/water_data" / "GCSM_-_Water_Table_Depth.geojson"
     ).to_crs(cfg.WI_EPSG)
 
     snapmaps=None
