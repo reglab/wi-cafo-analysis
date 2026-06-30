@@ -89,6 +89,7 @@ def setup_paths():
         "error": output_base / "03_error_analysis",
         "unpermitted": output_base / "04_unpermitted_analysis",
         "risk": output_base / "05_risk_assessment",
+        "sensitivity": output_base / "06_space_param_sensitivity",
         "tables": output_base / "tables",
         "pub_dataset": output_base / "publication_dataset",
     }
@@ -1243,6 +1244,14 @@ def main():
             "Requires that the publication dataset has already been generated."
         ),
     )
+    parser.add_argument(
+        "--skip-sensitivity", action="store_true",
+        help="Skip space-parameter sensitivity analysis (OAT sweeps + welfare scenarios).",
+    )
+    parser.add_argument(
+        "--sensitivity-workers", type=int, default=4,
+        help="Parallel threads for sensitivity analysis (default: 4).",
+    )
     args = parser.parse_args()
 
     recalc_pixel = args.recalculate_pixel_stats and not args.skip_pixel_stats
@@ -1342,16 +1351,27 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
 
     # 7. Unpermitted analysis — receives all_clusters so permit_rate_by_size uses
     # the same 'set' column as the notebook (from summary_table()).
-    print("\n=== 7/8: Unpermitted Analysis ===")
+    print("\n=== 7/10: Unpermitted Analysis ===")
     generate_unpermitted_analysis(data, subdirs, permit_matched, all_clusters=all_clusters)
 
     # 8. Publication dataset
-    print("\n=== 8/8: Publication Dataset ===")
+    print("\n=== 8/10: Publication Dataset ===")
     generate_publication_dataset(all_clusters, data["milk_producers"], subdirs)
 
     # 9. Milk license match statistics
-    print("\n=== 9/9: Milk License Match Statistics ===")
+    print("\n=== 9/10: Milk License Match Statistics ===")
     generate_milk_license_match_stats(data, subdirs)
+
+    # 10. Space-parameter sensitivity (OAT sweeps + welfare scenarios)
+    if not getattr(args, "skip_sensitivity", False):
+        print("\n=== 10/10: Space-Parameter Sensitivity ===")
+        import sensitivity_space_params as ssp
+        ssp.generate_space_param_sensitivity(
+            data, subdirs,
+            n_workers=getattr(args, "sensitivity_workers", 4),
+        )
+    else:
+        print("\n=== 10/10: Space-Parameter Sensitivity (skipped) ===")
 
 
 if __name__ == "__main__":
