@@ -34,6 +34,7 @@ import cluster_analysis_functions as caf
 import estimate_animal_units as est_au
 import analyze_model_outputs as amo
 import process_snapmaps
+import spatial_stats as sps
 
 
 def apply_paper_style():
@@ -90,6 +91,7 @@ def setup_paths():
         "unpermitted": output_base / "04_unpermitted_analysis",
         "risk": output_base / "05_risk_assessment",
         "sensitivity": output_base / "06_space_param_sensitivity",
+        "spatial": output_base / "07_spatial_clustering",
         "tables": output_base / "tables",
         "pub_dataset": output_base / "publication_dataset",
     }
@@ -682,6 +684,25 @@ def generate_unpermitted_analysis(data, subdirs, permit_matched, all_clusters=No
 
 
 # ============================================================================
+# Section 8b: Spatial clustering statistics (permitted vs. unpermitted potential)
+# ============================================================================
+
+def generate_spatial_clustering_analysis(all_clusters, subdirs, k=8, n_permutations=999, seed=0):
+    """Formal spatial-clustering tests for permitted vs. unpermitted potential CAFOs.
+
+    Replaces the visual "no strong clustering" claim with join-count/Moran's I,
+    Getis-Ord Gi*, a K-function difference test, and a nearest-neighbor cross-statistic,
+    all with permutation/Monte Carlo inference. → 07_spatial_clustering/.
+    """
+    out = subdirs["spatial"]
+    results = sps.run_spatial_clustering_analysis(
+        all_clusters, out_dir=out, k=k, n_permutations=n_permutations, seed=seed,
+    )
+    plt.close("all")
+    return results
+
+
+# ============================================================================
 # Section 9: Risk assessment (summary table, risk indices, figures)
 # ============================================================================
 
@@ -1249,6 +1270,15 @@ def main():
         help="Skip space-parameter sensitivity analysis (OAT sweeps + welfare scenarios).",
     )
     parser.add_argument(
+        "--skip-spatial-stats", action="store_true",
+        help="Skip spatial clustering statistics (join-count/Moran's I, Getis-Ord Gi*, "
+             "K-function difference, NN cross-statistic).",
+    )
+    parser.add_argument(
+        "--spatial-permutations", type=int, default=999,
+        help="Number of Monte Carlo permutations for spatial clustering tests (default: 999).",
+    )
+    parser.add_argument(
         "--sensitivity-workers", type=int, default=4,
         help="Parallel threads for sensitivity analysis (default: 4).",
     )
@@ -1351,27 +1381,38 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
 
     # 7. Unpermitted analysis — receives all_clusters so permit_rate_by_size uses
     # the same 'set' column as the notebook (from summary_table()).
-    print("\n=== 7/10: Unpermitted Analysis ===")
+    print("\n=== 7/11: Unpermitted Analysis ===")
     generate_unpermitted_analysis(data, subdirs, permit_matched, all_clusters=all_clusters)
 
-    # 8. Publication dataset
-    print("\n=== 8/10: Publication Dataset ===")
+    # 8. Spatial clustering statistics (join-count/Moran's I, Getis-Ord Gi*,
+    # K-function difference, NN cross-statistic) for permitted vs. unpermitted potential.
+    if not getattr(args, "skip_spatial_stats", False):
+        print("\n=== 8/11: Spatial Clustering Statistics ===")
+        generate_spatial_clustering_analysis(
+            all_clusters, subdirs,
+            n_permutations=getattr(args, "spatial_permutations", 999),
+        )
+    else:
+        print("\n=== 8/11: Spatial Clustering Statistics (skipped) ===")
+
+    # 9. Publication dataset
+    print("\n=== 9/11: Publication Dataset ===")
     generate_publication_dataset(all_clusters, data["milk_producers"], subdirs)
 
-    # 9. Milk license match statistics
-    print("\n=== 9/10: Milk License Match Statistics ===")
+    # 10. Milk license match statistics
+    print("\n=== 10/11: Milk License Match Statistics ===")
     generate_milk_license_match_stats(data, subdirs)
 
-    # 10. Space-parameter sensitivity (OAT sweeps + welfare scenarios)
+    # 11. Space-parameter sensitivity (OAT sweeps + welfare scenarios)
     if not getattr(args, "skip_sensitivity", False):
-        print("\n=== 10/10: Space-Parameter Sensitivity ===")
+        print("\n=== 11/11: Space-Parameter Sensitivity ===")
         import sensitivity_space_params as ssp
         ssp.generate_space_param_sensitivity(
             data, subdirs,
             n_workers=getattr(args, "sensitivity_workers", 4),
         )
     else:
-        print("\n=== 10/10: Space-Parameter Sensitivity (skipped) ===")
+        print("\n=== 11/11: Space-Parameter Sensitivity (skipped) ===")
 
 
 if __name__ == "__main__":

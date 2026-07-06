@@ -20,6 +20,11 @@ geofeather~=0.3.0
 pyarrow~=13.0.0
 affine~=2.4.0
 
+# Spatial statistics (Moran's I, join counts, Getis-Ord Gi*, point-pattern tests)
+esda~=2.9.0
+libpysal~=4.14.0
+pointpats~=2.5.0
+
 # Data processing helpers
 PyYAML~=6.0.0
 tqdm~=4.65.0
