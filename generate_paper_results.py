@@ -35,6 +35,7 @@ import estimate_animal_units as est_au
 import analyze_model_outputs as amo
 import process_snapmaps
 import spatial_stats as sps
+import permit_status_regression as psr
 
 
 def apply_paper_style():
@@ -701,6 +702,31 @@ def generate_spatial_clustering_analysis(data, all_clusters, subdirs, k=8, n_per
     )
     plt.close("all")
     return results
+
+
+# ============================================================================
+# Section 8c: Descriptive permit-status regression (Reviewer #2)
+# ============================================================================
+
+def generate_permit_status_regression(data, all_clusters, paths, subdirs):
+    """Descriptive logistic regression of permit status on size + confounders.
+
+    Addresses Reviewer #2: isolates the factors associated with holding a WPDES
+    permit while controlling for size, region (WDNR administrative region and
+    county dairy density), operational scale, and location. Optionally adds
+    Census/ACS county socioeconomic controls when a CENSUS_API_KEY is set (or a
+    cached ACS file exists). → tables/ + 04_unpermitted_analysis/.
+    """
+    census_cache = paths["data_path"] / "census_acs_county.csv"
+    res = psr.run_permit_status_regression(
+        all_clusters,
+        data["counties"],
+        save_table_path=subdirs["tables"] / "permit_status_regression.csv",
+        save_fig_path=subdirs["unpermitted"] / "permit_status_or_forest.svg",
+        census_cache_path=census_cache,
+    )
+    plt.close("all")
+    return res
 
 
 # ============================================================================
@@ -1412,6 +1438,11 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
     # the same 'set' column as the notebook (from summary_table()).
     print("\n=== 7/11: Unpermitted Analysis ===")
     generate_unpermitted_analysis(data, subdirs, permit_matched, all_clusters=all_clusters)
+
+    # 7b. Descriptive permit-status regression (Reviewer #2): what correlates
+    # with holding a permit, net of size, region, and operational factors.
+    print("\n=== 7b/11: Permit-Status Regression ===")
+    generate_permit_status_regression(data, all_clusters, paths, subdirs)
 
     # 8. Spatial clustering statistics (join-count/Moran's I, Getis-Ord Gi*,
     # K-function difference, NN cross-statistic) for permitted vs. unpermitted potential.
