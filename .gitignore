@@ -13,3 +13,6 @@ data/
 wicafo/
 .venv/
 *.egg-info/
+manuscript_latex/
+CLAUDE.md
+

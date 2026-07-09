@@ -61,6 +61,11 @@ def join_count_moran(gdf, label_col="permitted", k=8, permutations=999, seed=Non
     jc = Join_Counts(y, w, permutations=permutations)
     mi = Moran(y, w, permutations=permutations, two_tailed=True)
 
+    # esda's p_sim_bw is an upper-tail test (probability BW is *larger* than
+    # expected); segregation implies BW is *smaller* than expected, so also
+    # report the corresponding lower-tail pseudo p-value directly.
+    p_sim_bw_lower = (np.sum(jc.sim_bw <= jc.bw) + 1) / (permutations + 1)
+
     return {
         "k": k,
         "permutations": permutations,
@@ -73,6 +78,7 @@ def join_count_moran(gdf, label_col="permitted", k=8, permutations=999, seed=Non
             "BW_mixed": float(jc.bw),
             "p_sim_bb": float(jc.p_sim_bb),
             "p_sim_bw": float(jc.p_sim_bw),
+            "p_sim_bw_fewer_than_expected": float(p_sim_bw_lower),
             "p_sim_positive_autocorr": float(jc.p_sim_autocorr_pos),
             "p_sim_negative_autocorr": float(jc.p_sim_autocorr_neg),
         },
@@ -271,19 +277,22 @@ def nn_cross_test(gdf, label_col="permitted", n_permutations=999, seed=None):
 def run_spatial_clustering_analysis(all_clusters, out_dir=None, k=8, n_permutations=999,
                                      radii=None, seed=0, set_col="set",
                                      permitted_label="Permitted dairy CAFOs",
-                                     unpermitted_label="Unpermitted potential CAFOs"):
+                                     unpermitted_label="Unpermitted potential CAFOs",
+                                     county_data=None):
     """Run all four spatial-clustering tests on permitted vs. unpermitted-potential CAFOs.
 
     Args:
         all_clusters: GeoDataFrame with a categorical column (set_col) distinguishing
             permitted dairy CAFOs, unpermitted potential CAFOs, and (optionally) other
             categories that are dropped for this analysis.
-        out_dir: if provided, write spatial_clustering_stats.json (and a figure) here.
+        out_dir: if provided, write spatial_clustering_stats.json and figures here.
         k: number of nearest neighbors for the KNN spatial weights matrix.
         n_permutations: number of Monte Carlo permutations for all tests.
         radii: optional array of distances (m) for the K-function test; auto-chosen if None.
         seed: RNG seed for reproducibility.
         set_col, permitted_label, unpermitted_label: identify the two groups to compare.
+        county_data: optional GeoDataFrame of WI county boundaries, used as a basemap
+            for the Getis-Ord Gi* hot-spot map figure.
 
     Returns:
         dict of results from all four tests, plus the filtered GeoDataFrame used.
@@ -335,10 +344,11 @@ def run_spatial_clustering_analysis(all_clusters, out_dir=None, k=8, n_permutati
 
         gi_star_gdf.to_file(out_dir / "gi_star_hotspots.geojson", driver="GeoJSON")
 
-        _plot_k_diff_and_hotspots(k_diff, gi_star_gdf, out_dir / "spatial_clustering_diagnostics.svg")
+        _plot_k_function_difference(k_diff, out_dir / "k_function_difference.svg")
+        _plot_gi_star_map(gi_star_gdf, county_data, out_dir / "gi_star_hotspot_map.svg")
 
         print(f"  Saved spatial_clustering_stats.json, gi_star_hotspots.geojson, "
-              f"spatial_clustering_diagnostics.svg to {out_dir}")
+              f"k_function_difference.svg, gi_star_hotspot_map.svg to {out_dir}")
 
     _print_summary(results)
 
@@ -346,43 +356,64 @@ def run_spatial_clustering_analysis(all_clusters, out_dir=None, k=8, n_permutati
     return results
 
 
-def _plot_k_diff_and_hotspots(k_diff, gi_star_gdf, save_path):
+def _plot_k_function_difference(k_diff, save_path):
+    """D(r) = K_unpermitted(r) - K_permitted(r) with its 95% permutation envelope."""
     import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    import config.config_params as cfg
 
     r = np.asarray(k_diff["radii_m"]) / 1000
     d_obs = np.asarray(k_diff["d_observed"])
     lo = np.asarray(k_diff["envelope_lo_2.5pct"])
     hi = np.asarray(k_diff["envelope_hi_97.5pct"])
 
-    ax[0].fill_between(r, lo, hi, color="gray", alpha=0.3, label="95% permutation envelope")
-    ax[0].plot(r, d_obs, color="black", label="Observed D(r)")
-    ax[0].axhline(0, color="red", linestyle="--", linewidth=1)
-    ax[0].set_xlabel("Distance r (km)")
-    ax[0].set_ylabel(r"D(r) = $K_{unpermitted}(r) - K_{permitted}(r)$")
-    ax[0].set_title(f"K-function difference (global p={k_diff['mad_global_p_sim']:.3f})")
-    ax[0].legend()
-
-    sig = gi_star_gdf[gi_star_gdf["gi_star_p_sim"] < 0.05]
-    nonsig = gi_star_gdf[gi_star_gdf["gi_star_p_sim"] >= 0.05]
-    c = gi_star_gdf.geometry.centroid
-    nonsig_c = nonsig.geometry.centroid
-    sig_c = sig.geometry.centroid
-    ax[1].scatter(nonsig_c.x, nonsig_c.y, c="lightgray", s=8, label="Not significant")
-    hot = sig[sig["gi_star_z"] > 0]
-    cold = sig[sig["gi_star_z"] < 0]
-    ax[1].scatter(hot.geometry.centroid.x, hot.geometry.centroid.y, c="red", s=12,
-                  label=f"Hot spot (n={len(hot)})")
-    ax[1].scatter(cold.geometry.centroid.x, cold.geometry.centroid.y, c="blue", s=12,
-                  label=f"Cold spot (n={len(cold)})")
-    ax[1].set_title("Getis-Ord Gi* local clusters of unpermitted share")
-    ax[1].set_aspect("equal")
-    ax[1].axis("off")
-    ax[1].legend()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.fill_between(r, lo, hi, color="gray", alpha=0.3,
+                     label="95\\% permutation envelope\n(random-labeling null)")
+    ax.plot(r, d_obs, color="black", linewidth=cfg.FIG_LINEWIDTH, label="Observed $D(r)$")
+    ax.axhline(0, color="black", linestyle="--", linewidth=0.8)
+    ax.set_xlabel("Distance $r$ (km)")
+    ax.set_ylabel(r"$D(r) = K_{\mathrm{unpermitted}}(r) - K_{\mathrm{permitted}}(r)$")
+    ax.legend(frameon=True)
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150)
+    plt.savefig(save_path, dpi=cfg.FIG_DPI, format=cfg.FIG_EXPORT_FORMAT)
+    plt.close(fig)
+
+
+def _plot_gi_star_map(gi_star_gdf, county_data, save_path, alpha=0.05):
+    """Map of significant Getis-Ord Gi* hot spots (unpermitted-heavy) and cold spots
+    (permitted-heavy), colored to match the permitted/unpermitted palette used
+    throughout the paper.
+    """
+    import matplotlib.pyplot as plt
+    import config.config_params as cfg
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    if county_data is not None:
+        county_data.to_crs(cfg.WI_EPSG).plot(
+            ax=ax, edgecolor="black", linewidth=1, color="lightgray", alpha=0.2,
+        )
+
+    c = gi_star_gdf.geometry.centroid
+    sig = gi_star_gdf["gi_star_p_sim"] < alpha
+    hot = sig & (gi_star_gdf["gi_star_z"] > 0)
+    cold = sig & (gi_star_gdf["gi_star_z"] < 0)
+    nonsig = ~sig
+
+    ax.scatter(c[nonsig].x, c[nonsig].y, c="lightgray", s=6,
+               label=f"Not significant (n={nonsig.sum()})")
+    ax.scatter(c[hot].x, c[hot].y, c=cfg.COLOR_UNPERMITTED, s=14,
+               label=f"Unpermitted-heavy hot spot (n={hot.sum()})")
+    ax.scatter(c[cold].x, c[cold].y, c=cfg.COLOR_PERMITTED, s=14,
+               label=f"Permitted-heavy cold spot (n={cold.sum()})")
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.legend(loc="lower left", frameon=True)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=cfg.FIG_DPI, format=cfg.FIG_EXPORT_FORMAT)
     plt.close(fig)
 
 

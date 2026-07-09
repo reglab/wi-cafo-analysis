@@ -687,7 +687,7 @@ def generate_unpermitted_analysis(data, subdirs, permit_matched, all_clusters=No
 # Section 8b: Spatial clustering statistics (permitted vs. unpermitted potential)
 # ============================================================================
 
-def generate_spatial_clustering_analysis(all_clusters, subdirs, k=8, n_permutations=999, seed=0):
+def generate_spatial_clustering_analysis(data, all_clusters, subdirs, k=8, n_permutations=999, seed=0):
     """Formal spatial-clustering tests for permitted vs. unpermitted potential CAFOs.
 
     Replaces the visual "no strong clustering" claim with join-count/Moran's I,
@@ -697,6 +697,7 @@ def generate_spatial_clustering_analysis(all_clusters, subdirs, k=8, n_permutati
     out = subdirs["spatial"]
     results = sps.run_spatial_clustering_analysis(
         all_clusters, out_dir=out, k=k, n_permutations=n_permutations, seed=seed,
+        county_data=data["counties"],
     )
     plt.close("all")
     return results
@@ -754,6 +755,9 @@ def generate_risk_assessment(data, paths, subdirs, skip_imagery=False,
         print(f"  Using pre-computed cluster data: {precomputed_path}")
         print("  (snapmaps loading and summary_table() skipped)")
         all_clusters = gpd.read_parquet(precomputed_path)
+        if "set" not in all_clusters.columns and "type" in all_clusters.columns:
+            # Older publication-dataset exports used 'type' before it was renamed to 'set'.
+            all_clusters = all_clusters.rename(columns={"type": "set"})
     else:
         # ── full path: load snapmaps + run summary_table ──────────────────────
         snapmaps = data.get("snapmaps")
@@ -831,6 +835,31 @@ def generate_risk_assessment(data, paths, subdirs, skip_imagery=False,
     cf.plot_risk_index_by_au_category(
         all_clusters, "pca_risk_index",
         save_path=out_risk / "pca_index_by_au_cat.svg",
+    )
+
+    # Multivariate regression: does permit status remain associated with risk
+    # once size (and other facility/location factors) are controlled for
+    # simultaneously, rather than just compared within AU bins? Reviewer comment
+    # on the bin plots above. Also tests robustness to alternative risk-index designs.
+    cf.run_permit_risk_regression(
+        all_clusters, WEIGHTS_DICT, INVERT_VARIABLES,
+        risk_col="hand_built_risk_index",
+        size_col="animal_unit_estimate",
+        n_robustness_draws=500,
+        save_table_path=out_tables / "risk_regression_summary.csv",
+        save_fig_path=out_risk / "risk_regression_weight_robustness.svg",
+    )
+    # Same regression, but controlling for cluster footprint area (a directly
+    # measured facility size) instead of the AU estimate, which carries Monte
+    # Carlo estimation uncertainty — checks the finding isn't an artifact of
+    # noise in the AU estimation model.
+    cf.run_permit_risk_regression(
+        all_clusters, WEIGHTS_DICT, INVERT_VARIABLES,
+        risk_col="hand_built_risk_index",
+        size_col="cluster_area_m2",
+        n_robustness_draws=500,
+        save_table_path=out_tables / "risk_regression_summary_area.csv",
+        save_fig_path=out_risk / "risk_regression_weight_robustness_area.svg",
     )
 
     # Sensitivity analysis: does the permitted vs unpermitted finding hold under
@@ -1389,7 +1418,7 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
     if not getattr(args, "skip_spatial_stats", False):
         print("\n=== 8/11: Spatial Clustering Statistics ===")
         generate_spatial_clustering_analysis(
-            all_clusters, subdirs,
+            data, all_clusters, subdirs,
             n_permutations=getattr(args, "spatial_permutations", 999),
         )
     else:

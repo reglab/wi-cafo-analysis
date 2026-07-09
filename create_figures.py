@@ -20,6 +20,7 @@ import scipy.stats as ss
 import fiona
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+import statsmodels.formula.api as smf
 
 
 # our files
@@ -2417,6 +2418,204 @@ def add_hand_built_risk_index(all_clusters: gpd.GeoDataFrame,
     all_clusters.loc[normalized.index, 'hand_built_risk_index'] = risk_index_norm
 
     return all_clusters
+
+
+def run_permit_risk_regression(
+    all_clusters: gpd.GeoDataFrame,
+    weights_dict: dict,
+    invert_variables: list[str],
+    risk_col: str = "hand_built_risk_index",
+    size_col: str = "animal_unit_estimate",
+    n_robustness_draws: int = 500,
+    seed: int = 42,
+    save_table_path=None,
+    save_fig_path=None,
+):
+    """Multivariate test of whether permit status predicts environmental risk
+    once facility size (and other factors) are controlled for.
+
+    Addresses reviewer comment: the bin plots (plot_risk_index_by_au_category)
+    show raw group means within AU bins, which does not by itself establish
+    that permit status is associated with risk *net of* size. This runs three
+    stages of OLS (HC1-robust SEs), each regressing the risk index on
+    ``permitted`` (1 = permitted CAFO):
+      1. Size-only:      risk ~ permitted + log(size_col)
+                          ``size_col`` defaults to animal_unit_estimate, but
+                          can be set to cluster_area_m2 — a directly measured
+                          facility footprint that carries none of the Monte
+                          Carlo estimation uncertainty baked into the AU
+                          estimate — as a cleaner, complementary size measure.
+      2. Full controls:  + n_buildings, n_parcels (facility structural
+                          complexity — number of buildings/parcels making up
+                          the operation, independent of its size), and
+                          matched_milk (whether the facility is matched to a
+                          licensed, active dairy business — a proxy for
+                          operation type/formality distinct from size).
+                          We deliberately do not control for the other size
+                          measure (animal_unit_estimate/cluster_area_m2,
+                          whichever isn't already the size_col — the two are
+                          near-collinear) or location (a coarse geographic
+                          control risks netting out the very spatial risk
+                          differences the index is designed to measure, since
+                          the index is itself built from geographic distance
+                          variables).
+      3. Robustness of stage 2 to the risk index's design:
+           a. pca_risk_index in place of the hand-built index
+           b. an equal-weighted version of the hand-built index
+           c. `n_robustness_draws` random re-weightings of the hand-built
+              index (Dirichlet draws over the risk-variable simplex, as in
+              plot_risk_sensitivity_bands)
+
+    Returns a dict with the fitted statsmodels results, a summary DataFrame,
+    and the per-draw robustness coefficients/p-values.
+    """
+    work = all_clusters.copy()
+    work["permitted_num"] = work["permitted"].astype(int)
+    work["log_size"] = np.log(work[size_col])
+    work["matched_milk_num"] = work["matched_milk"].astype(int)
+
+    size_only_formula = f"{risk_col} ~ permitted_num + log_size"
+    full_formula = (
+        f"{risk_col} ~ permitted_num + log_size "
+        "+ n_buildings + n_parcels + matched_milk_num"
+    )
+
+    def _fit(df, formula):
+        sub = df[[c.strip() for c in formula.replace("~", "+").split("+")]].dropna()
+        model = smf.ols(formula, data=sub).fit(cov_type="HC1")
+        return model, len(sub)
+
+    m1, n1 = _fit(work, size_only_formula)
+    m2, n2 = _fit(work, full_formula)
+
+    # ── robustness (a): PCA-based index ──────────────────────────────────────
+    m3a, n3a = _fit(work, full_formula.replace(risk_col, "pca_risk_index", 1))
+
+    # ── robustness (b): equal-weighted hand-built index ──────────────────────
+    equal_weights = {k: 1.0 for k in weights_dict}
+    work_eq = add_hand_built_risk_index(work.copy(), equal_weights, invert_variables)
+    work["equal_weighted_risk_index"] = work_eq["hand_built_risk_index"]
+    m3b, n3b = _fit(work, full_formula.replace(risk_col, "equal_weighted_risk_index", 1))
+
+    # ── robustness (c): random weight-perturbation draws ─────────────────────
+    # Pre-process exactly as in add_hand_built_risk_index, so each draw only
+    # differs in the weight vector applied to the normalized risk variables.
+    risk_variables = [k for k in weights_dict if k in all_clusters.columns]
+    wp = all_clusters[risk_variables].copy()
+    for col in risk_variables:
+        if wp[col].dtype == bool:
+            wp[col] = wp[col].astype(int)
+    for var in invert_variables:
+        if var in wp.columns:
+            wp[var] = 1.0 / (wp[var] + 1)
+    normed = pd.DataFrame(index=wp.index)
+    for var in risk_variables:
+        c = wp[var]
+        cmin, cmax = c.min(), c.max()
+        normed[var] = (c - cmin) / (cmax - cmin) if cmax > cmin else 0.5
+    normed_mat = normed.values
+
+    reg_df = work.loc[
+        normed.index,
+        ["permitted_num", "log_size", "n_buildings", "n_parcels", "matched_milk_num"],
+    ].copy()
+
+    rng = np.random.default_rng(seed)
+    draws = rng.dirichlet(np.ones(len(risk_variables)), size=n_robustness_draws)
+    draw_coefs, draw_pvals = [], []
+    for w in draws:
+        score = normed_mat @ (w / w.sum())
+        smin, smax = score.min(), score.max()
+        reg_df["_draw_risk"] = (
+            (score - smin) / (smax - smin) if smax > smin else np.full_like(score, 0.5)
+        )
+        sub = reg_df.dropna()
+        m = smf.ols(
+            "_draw_risk ~ permitted_num + log_size + n_buildings "
+            "+ n_parcels + matched_milk_num",
+            data=sub,
+        ).fit(cov_type="HC1")
+        draw_coefs.append(m.params["permitted_num"])
+        draw_pvals.append(m.pvalues["permitted_num"])
+    draw_coefs = np.array(draw_coefs)
+    draw_pvals = np.array(draw_pvals)
+
+    baseline_sign = np.sign(m2.params["permitted_num"])
+    pct_same_sign = float(np.mean(np.sign(draw_coefs) == baseline_sign))
+    pct_significant = float(np.mean(draw_pvals < 0.05))
+
+    # ── summary table ─────────────────────────────────────────────────────────
+    def _row(name, model, n):
+        return {
+            "model": name, "n": n,
+            "permitted_coef": model.params["permitted_num"],
+            "robust_se": model.bse["permitted_num"],
+            "p_value": model.pvalues["permitted_num"],
+            "r_squared": model.rsquared,
+            "pct_draws_same_sign": np.nan,
+            "pct_draws_significant_p05": np.nan,
+        }
+
+    summary_df = pd.DataFrame([
+        _row(f"1. Size-only (risk ~ permitted + log {size_col})", m1, n1),
+        _row("2. Full controls (+ buildings, parcels, milk license match)", m2, n2),
+        _row("3a. Robustness: PCA risk index", m3a, n3a),
+        _row("3b. Robustness: equal-weighted index", m3b, n3b),
+    ])
+    summary_df.loc[len(summary_df)] = {
+        "model": f"3c. Robustness: {n_robustness_draws} random weight draws (mean ± SD)",
+        "n": n2,
+        "permitted_coef": draw_coefs.mean(),
+        "robust_se": draw_coefs.std(),
+        "p_value": np.nan,
+        "r_squared": np.nan,
+        "pct_draws_same_sign": pct_same_sign,
+        "pct_draws_significant_p05": pct_significant,
+    }
+
+    print(f"\n  Multivariate permit-status risk regression (size measure: {size_col}):")
+    for _, row in summary_df.iterrows():
+        print(f"    {row['model']:60s} beta={row['permitted_coef']:+.4f}  n={row['n']}")
+    print(f"    Weight-draw robustness: {pct_same_sign:.0%} of {n_robustness_draws} draws share "
+          f"the baseline's sign; {pct_significant:.0%} are significant at p<0.05")
+
+    if save_table_path is not None:
+        summary_df.to_csv(save_table_path, index=False)
+        print(f"  Saved {Path(save_table_path).name}")
+
+    # ── figure: distribution of the permitted coefficient across weight draws ─
+    if save_fig_path is not None:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.hist(draw_coefs, bins=40, color="#888888", alpha=0.7,
+                label=f"{n_robustness_draws} random weight draws")
+        ax.axvline(m2.params["permitted_num"], color=cfg.COLOR_THRESHOLD_LINE,
+                   linewidth=cfg.FIG_LINEWIDTH, linestyle="--",
+                   label="Published (hand-built) weights")
+        ax.axvline(m3a.params["permitted_num"], color="black",
+                   linewidth=cfg.FIG_LINEWIDTH, linestyle=":",
+                   label="PCA-based index")
+        ax.axvline(m3b.params["permitted_num"], color="steelblue",
+                   linewidth=cfg.FIG_LINEWIDTH, linestyle="-.",
+                   label="Equal-weighted index")
+        ax.axvline(0, color="black", linewidth=1.0)
+        ax.set_xlabel("Coefficient on permitted status\n(controlling for size and other factors)")
+        ax.set_ylabel("Count of weight draws")
+        for sp in ["top", "right"]: ax.spines[sp].set_visible(False)
+        ax.legend(frameon=True, fontsize=cfg.FIG_LEGEND_SIZE)
+        plt.tight_layout()
+        fig.savefig(save_fig_path, bbox_inches="tight")
+        plt.close("all")
+        print(f"  Saved {Path(save_fig_path).name}")
+
+    return {
+        "models": {
+            "size_only": m1, "full_controls": m2,
+            "pca_index": m3a, "equal_weighted_index": m3b,
+        },
+        "summary": summary_df,
+        "weight_draw_coefs": draw_coefs,
+        "weight_draw_pvals": draw_pvals,
+    }
 
 
 def unperm_universe_table(
