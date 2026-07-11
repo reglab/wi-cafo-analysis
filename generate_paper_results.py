@@ -37,6 +37,7 @@ import analyze_model_outputs as amo
 import process_snapmaps
 import spatial_stats as sps
 import permit_status_regression as psr
+import regional_robustness_analysis as rra
 
 
 def apply_paper_style():
@@ -226,6 +227,27 @@ def generate_model_validation(data, subdirs):
 
     print(f"  Saved 6 figures to {out}")
     return permit_matched
+
+
+# ============================================================================
+# Section 3a: Cross-regional robustness of validation error rates (reviewer:
+# clustering thresholds are empirically defined; cross-regional robustness
+# requires further validation)
+# ============================================================================
+
+def generate_regional_robustness_analysis(data, permit_matched, subdirs):
+    """Test whether WDNR permit recall, AU discrepancy, and EWG precision/
+    recall diverge across Wisconsin's 5 WDNR administrative regions under the
+    clustering thresholds (500m fuzzy-name distance, 25% building overlap,
+    150m proximity) as currently set. → tables/ + 01_model_validation/.
+
+    permit_matched: the dairy-only permit-matched clusters from
+        generate_model_validation(), reused so the AU discrepancy numbers
+        match the rest of the paper.
+    """
+    results = rra.run_regional_robustness_analysis(data, permit_matched, subdirs)
+    plt.close("all")
+    return results
 
 
 # ============================================================================
@@ -2456,6 +2478,12 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
     # 1. Model validation
     print("\n=== 1/8: Model Validation ===")
     permit_matched = generate_model_validation(data, subdirs)
+
+    # 1a. Cross-regional robustness of validation error rates (reviewer:
+    # clustering thresholds are empirically defined; test whether permit
+    # recall / AU discrepancy / EWG precision diverge across WDNR regions).
+    print("\n=== 1a: Cross-Regional Robustness ===")
+    generate_regional_robustness_analysis(data, permit_matched, subdirs)
 
     # 2. Segmentation quality
     print("\n=== 2/8: Segmentation Quality ===")
