@@ -12,6 +12,7 @@ Outputs are saved to paper_results/ with subdirectories for each analysis sectio
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -343,6 +344,54 @@ def generate_error_analysis(data, paths, subdirs, skip_imagery=False):
 # Section 6: Image review efficiency stats
 # ============================================================================
 
+# Wisconsin has no dedicated Census "Urban Area" (uac) layer in the TIGER
+# extract we have on hand (data/WI_urban_areas is a bulk per-county dump with
+# no uac file, and the statewide tabblock20 file's UR20/UACE20 urban-flag
+# fields are unpopulated in this extract). tl_2020_55_place20.shp
+# (incorporated cities/villages) is the closest deterministic, statewide
+# proxy for "urban area" and is what the >500m urban-proximity filter uses
+# below and in generate_ewg_fp_waterfall().
+URBAN_AREA_PROXY_PATH = "WI_urban_areas/tl_2020_55_place20.shp"
+
+
+def _add_cf_review_flags(four_band_clusters, all_cf_clusters, paths):
+    """Add any_images_sent and matched_to_CF_annot to four_band_clusters.
+
+      any_images_sent     – cluster has ≥1 image that was sent to CF for labeling
+      matched_to_CF_annot – cluster is within 10m of a human-annotated cluster
+
+    Shared by generate_image_review_stats() and
+    generate_cf_unmatched_fp_analysis() so the two analyses can't drift.
+    """
+    four_band = four_band_clusters.copy()
+
+    all_labeled_images = cf.get_labeled_images(how="csv", data_path=paths["data_path"])
+    labeled_set = set(all_labeled_images["Image name"].tolist())
+    four_band["any_images_sent"] = four_band["jpeg_names"].apply(
+        lambda x: any(item in labeled_set for item in (x if isinstance(x, (list, tuple)) else []))
+    )
+
+    # matched_to_CF_annot: sjoin_nearest to all_cf_clusters, max 10m.
+    # how='left' so unmatched rows get NaN, then matched_to_CF_annot = ~cf_polygon_indices.isna()
+    cf_clusters = all_cf_clusters[["geometry", "polygon_indices"]].rename(
+        columns={"polygon_indices": "cf_polygon_indices"}
+    ).copy()
+    four_band = gpd.sjoin_nearest(
+        four_band, cf_clusters, max_distance=10, how="left", distance_col="distance_to_cf"
+    )
+    # polygon_indices is list-valued (loaded with literal_eval), so
+    # drop_duplicates must use a str key.
+    four_band["_pstr2"] = four_band["polygon_indices"].apply(str)
+    four_band = four_band.sort_values("distance_to_cf").drop_duplicates(
+        subset="_pstr2", keep="first"
+    ).drop(columns=["_pstr2"])
+    four_band["matched_to_CF_annot"] = ~four_band["cf_polygon_indices"].isna()
+    four_band = four_band.drop(
+        columns=["cf_polygon_indices", "distance_to_cf", "index_right"], errors="ignore"
+    )
+    return four_band
+
+
 def generate_image_review_stats(data, paths, subdirs):
     """Compute and save stats on human imagery review reduction. → tables/.
 
@@ -353,43 +402,12 @@ def generate_image_review_stats(data, paths, subdirs):
       4. need_to_send = not sent AND not already annotated
       5. Count unique images where need_to_send OR any_images_sent
     """
-    four_band = data["four_band_clusters"].copy()
-
-    # ------------------------------------------------------------------
-    # 1. any_images_sent: check jpeg_names against CF labeled image list
-    # ------------------------------------------------------------------
-    all_labeled_images = cf.get_labeled_images(how="json", data_path=paths["data_path"])
-    labeled_set = set(all_labeled_images["Image name"].tolist())
-    four_band["any_images_sent"] = four_band["jpeg_names"].apply(
-        lambda x: any(item in labeled_set for item in (x if isinstance(x, (list, tuple)) else []))
-    )
-
-    # ------------------------------------------------------------------
-    # 2. matched_to_CF_annot: sjoin_nearest to all_cf_clusters, max 10m
-    #    Mirrors notebook cell 5: how='left' so unmatched rows get NaN,
-    #    then matched_to_CF_annot = ~cf_polygon_indices.isna()
-    # ------------------------------------------------------------------
-    cf_clusters = data["all_cf_clusters"][["geometry", "polygon_indices"]].rename(
-        columns={"polygon_indices": "cf_polygon_indices"}
-    ).copy()
-    four_band = gpd.sjoin_nearest(
-        four_band, cf_clusters, max_distance=10, how="left", distance_col="distance_to_cf"
-    )
-    # polygon_indices is list-valued (loaded with literal_eval), so drop_duplicates
-    # must use a str key — identical to step 6 below.
-    four_band["_pstr2"] = four_band["polygon_indices"].apply(str)
-    four_band = four_band.sort_values("distance_to_cf").drop_duplicates(
-        subset="_pstr2", keep="first"
-    ).drop(columns=["_pstr2"])
-    four_band["matched_to_CF_annot"] = ~four_band["cf_polygon_indices"].isna()
-    four_band = four_band.drop(
-        columns=["cf_polygon_indices", "distance_to_cf", "index_right"], errors="ignore"
-    )
+    four_band = _add_cf_review_flags(data["four_band_clusters"], data["all_cf_clusters"], paths)
 
     # ------------------------------------------------------------------
     # 3. Urban area filter: keep clusters >500m from any urban area
     # ------------------------------------------------------------------
-    urban_areas_path = paths["data_path"] / "WI_urban_areas"
+    urban_areas_path = paths["data_path"].parent / URBAN_AREA_PROXY_PATH
     four_band = four_band.drop(columns=["index_right"], errors="ignore")
     try:
         urban_areas = gpd.read_file(urban_areas_path).to_crs(cfg.WI_EPSG)
@@ -473,6 +491,409 @@ def generate_image_review_stats(data, paths, subdirs):
     print(f"  Total WI images: {total_wi_images}")
     print(f"  Images needing review: {images_to_send}")
     print(f"  Reduction factor: {reduction_factor:.1f}x")
+
+
+# ============================================================================
+# Section 6a: False-positive waterfalls (Reviewer #1, Limitation 2)
+# ============================================================================
+#
+# Two separate waterfalls, not one combined pool. The EWG-region set and the
+# CF-sent-but-unmatched set differ in a way that matters for what "removing a
+# false positive" even means:
+#
+#   - In the EWG region, EWG's AFO census is treated as a complete ground
+#     truth, so "unmatched to an EWG dairy" is a clean starting definition of
+#     "candidate false positive" with no pre-filtering baked in. The full
+#     minimum-size / urban / keyword / milk-license waterfall is meaningful
+#     here because none of those filters have been applied yet.
+#   - The CF-sent-but-unmatched set was already screened by size, urban-area,
+#     and parcel-keyword criteria *before* being selected for CF review (the
+#     same need_to_send logic in generate_image_review_stats). Re-running
+#     those same filters on this set would mostly just show they remove
+#     ~nothing — an artifact of double-filtering, not a real result. Only the
+#     milk-license check adds information here.
+
+
+def _save_fp_residual_csv(residual_gdf, out_path):
+    """Write a false-positive residual to CSV with lat/lon instead of geometry."""
+    out = residual_gdf.copy()
+    centroids_4326 = out.geometry.centroid.to_crs(4326)
+    out["lat"] = centroids_4326.y
+    out["lon"] = centroids_4326.x
+    out = out[[
+        "polygon_indices", "source", "animal_unit_estimate", "cluster_area_m2",
+        "parcel_owner1_names", "jpeg_names", "ewg_region", "lat", "lon",
+    ]]
+    out.to_csv(out_path, index=False)
+
+
+def generate_ewg_fp_waterfall(data, paths, subdirs):
+    """False-positive waterfall for the EWG region (EWG's AFO census treated
+    as complete ground truth).
+
+    Candidate definition: ALL four_band_clusters in the EWG region that do
+    not sjoin_nearest (400m) to any EWG *dairy* facility (Animal_Typ=='Dairy',
+    plus the 'Cattle: Small' legend category that the existing pr-curve code
+    in facility_level_pr_lowerbound_graph() also treats as small dairy — a
+    match to a non-dairy EWG facility, e.g. hogs, does not rescue a candidate
+    here, since the model targets dairy CAFOs specifically). No size
+    pre-filter — minimum-size is the first waterfall step below, so its
+    contribution is measured rather than baked into the candidate
+    definition.
+
+    Waterfall, in the order given in the reviewer response:
+      1. minimum-size filter (>500 AU, the paper's chosen operating threshold)
+      2. urban-area proximity (>500m from an incorporated place)
+      3. parcel-owner keyword exclusion
+      4. milk-license rescue (within 500m) — a nearby milk license means the
+         detection is probably a real dairy operation EWG's census missed,
+         not a model false positive, so it's removed from the FP tally here
+         rather than confirmed as a genuine detection.
+
+    Because EWG's census is treated as complete for this region, the full
+    final residual — not a sample — is the manual-review target (see
+    generate_fp_manual_review_sample with n_sample=None).
+
+    Writes fp_ewg_waterfall.csv and fp_ewg_residual.csv to tables/.
+    Returns (waterfall_df, residual_gdf).
+    """
+    four_band = data["four_band_clusters"]
+    ewg_afos = data["ewg_afos"]
+    ewg_dairy = ewg_afos[
+        (ewg_afos["Animal_Typ"] == "Dairy")
+        | ((ewg_afos["Animal_Typ"] == "Cattle") & (ewg_afos["Legend"] == "Cattle: Small"))
+    ]
+
+    pool = four_band[four_band["ewg_region"] == True].copy()
+    matches = ewg_dairy.sjoin_nearest(pool, max_distance=400)
+    matched_idx = set(matches["index_right"].unique())
+    pool = pool[~pool.index.isin(matched_idx)].copy()
+    n0 = len(pool)
+
+    print(f"\n  EWG-region FP candidate pool (unmatched to an EWG dairy facility): {n0}")
+
+    steps = [{"step": "0_total_candidate_fps", "n_remaining": n0, "n_removed": 0}]
+    remaining = pool.copy()
+
+    # ---- Step 1: minimum-size filter (paper's chosen 500 AU operating threshold) ----
+    before = len(remaining)
+    remaining = remaining[remaining["animal_unit_estimate"] > 500].copy()
+    steps.append({
+        "step": "1_min_size_gt500AU",
+        "n_remaining": len(remaining), "n_removed": before - len(remaining),
+    })
+
+    # ---- Step 2: urban-area proximity filter (>500m from incorporated place) ----
+    before = len(remaining)
+    try:
+        urban_areas = gpd.read_file(
+            paths["data_path"].parent / URBAN_AREA_PROXY_PATH
+        ).to_crs(cfg.WI_EPSG)
+        remaining = remaining.sjoin_nearest(
+            urban_areas[["geometry"]], distance_col="dist_to_urban"
+        )
+        remaining = remaining[~remaining.index.duplicated(keep="first")]
+        remaining = remaining[remaining["dist_to_urban"] > 500].copy()
+        remaining = remaining.drop(columns=["index_right", "dist_to_urban"], errors="ignore")
+    except Exception as e:
+        print(f"  Warning: could not apply urban area filter: {e}")
+    steps.append({
+        "step": "2_urban_area_gt500m",
+        "n_remaining": len(remaining), "n_removed": before - len(remaining),
+    })
+
+    # ---- Step 3: parcel-owner keyword exclusion ----
+    exclude_keywords = ["STORAG", "CHEMICAL", "ELECTRONIC", "WOOD"]
+    before = len(remaining)
+    remaining = remaining[
+        ~remaining["parcel_owner1_names"].apply(
+            lambda x: any(kw in str(x) for kw in exclude_keywords)
+        )
+    ].copy()
+    steps.append({
+        "step": "3_parcel_keyword_exclude",
+        "n_remaining": len(remaining), "n_removed": before - len(remaining),
+    })
+
+    # ---- Step 4: milk-license rescue (within 500m) ----
+    before = len(remaining)
+    milk_wi = data["milk_producers"].set_geometry("location").to_crs(cfg.WI_EPSG)
+    matched_milk = remaining.sjoin_nearest(milk_wi[["location"]], max_distance=500, how="inner")
+    milk_pstrs = set(matched_milk["polygon_indices"].apply(str))
+    remaining = remaining[~remaining["polygon_indices"].apply(str).isin(milk_pstrs)].copy()
+    steps.append({
+        "step": "4_milk_license_rescue_500m",
+        "n_remaining": len(remaining), "n_removed": before - len(remaining),
+    })
+
+    waterfall = pd.DataFrame(steps)
+    waterfall["pct_of_total_removed_this_step"] = 100 * waterfall["n_removed"] / n0
+    waterfall["cumulative_pct_resolved"] = 100 * (n0 - waterfall["n_remaining"]) / n0
+    waterfall.to_csv(subdirs["tables"] / "fp_ewg_waterfall.csv", index=False)
+
+    print("\n  EWG-region false-positive waterfall:")
+    print(waterfall.to_string(index=False))
+    print(f"\n  Residual requiring manual review (full census — EWG assumed complete): "
+          f"{len(remaining)} ({100 * len(remaining) / n0:.1f}% of {n0})")
+
+    remaining = remaining.copy()
+    remaining["source"] = "ewg_unmatched"
+    _save_fp_residual_csv(remaining, subdirs["tables"] / "fp_ewg_residual.csv")
+
+    print(f"  Saved fp_ewg_waterfall.csv, fp_ewg_residual.csv to {subdirs['tables']}")
+    return waterfall, remaining
+
+
+def generate_cf_unmatched_fp_analysis(data, paths, subdirs):
+    """False-positive analysis for the CF-sent-but-unmatched set: clusters
+    with >=1 image sent to CloudFactory for labeling where CF did not draw
+    an annotation (any_images_sent & ~matched_to_CF_annot).
+
+    Unlike the EWG-region set, this candidate pool was already screened by
+    size/urban-area/parcel-keyword criteria before being selected for CF
+    review (the same need_to_send logic in generate_image_review_stats), so
+    re-applying those filters here would mostly show they remove ~nothing —
+    a double-filtering artifact, not a real result. The only filter that
+    adds information at this point is the milk-license rescue: a nearby
+    milk license means the detection is probably a real, if EWG-invisible,
+    dairy operation rather than a genuine false positive.
+
+    This set is also noisier than the EWG-region one: CF can skip
+    annotating an image for reasons unrelated to "not a farm" (partial
+    facility at a tile edge, already covered by another image, etc.), and
+    there's no complete-census assumption backing it here. So instead of a
+    full census, a random sample of the residual is manually reviewed (see
+    generate_fp_manual_review_sample).
+
+    Writes fp_cf_unmatched_waterfall.csv and fp_cf_unmatched_residual.csv to
+    tables/. Returns (waterfall_df, residual_gdf).
+    """
+    four_band = _add_cf_review_flags(data["four_band_clusters"], data["all_cf_clusters"], paths)
+
+    pool = four_band[
+        (four_band["any_images_sent"] == True) & (four_band["matched_to_CF_annot"] == False)
+    ].copy()
+    n0 = len(pool)
+    print(f"\n  CF-sent-unmatched FP candidate pool: {n0}")
+
+    steps = [{"step": "0_total_candidate_fps", "n_remaining": n0, "n_removed": 0}]
+    remaining = pool.copy()
+
+    # ---- Only filter applied: milk-license rescue (within 500m) ----
+    before = len(remaining)
+    milk_wi = data["milk_producers"].set_geometry("location").to_crs(cfg.WI_EPSG)
+    matched_milk = remaining.sjoin_nearest(milk_wi[["location"]], max_distance=500, how="inner")
+    milk_pstrs = set(matched_milk["polygon_indices"].apply(str))
+    remaining = remaining[~remaining["polygon_indices"].apply(str).isin(milk_pstrs)].copy()
+    steps.append({
+        "step": "1_milk_license_rescue_500m",
+        "n_remaining": len(remaining), "n_removed": before - len(remaining),
+    })
+
+    waterfall = pd.DataFrame(steps)
+    waterfall["pct_of_total_removed_this_step"] = 100 * waterfall["n_removed"] / n0
+    waterfall["cumulative_pct_resolved"] = 100 * (n0 - waterfall["n_remaining"]) / n0
+    waterfall.to_csv(subdirs["tables"] / "fp_cf_unmatched_waterfall.csv", index=False)
+
+    print("\n  CF-sent-unmatched false-positive waterfall:")
+    print(waterfall.to_string(index=False))
+    print(f"\n  Residual for random-sample manual review: {len(remaining)} "
+          f"({100 * len(remaining) / n0:.1f}% of {n0})")
+
+    remaining = remaining.copy()
+    remaining["source"] = "cf_sent_unmatched"
+    _save_fp_residual_csv(remaining, subdirs["tables"] / "fp_cf_unmatched_residual.csv")
+
+    print(f"  Saved fp_cf_unmatched_waterfall.csv, fp_cf_unmatched_residual.csv to {subdirs['tables']}")
+    return waterfall, remaining
+
+
+# ============================================================================
+# Section 6b: Manual-review sample for unresolved FP candidates
+# ============================================================================
+
+def generate_fp_manual_review_sample(data, paths, subdirs, residual, label, n_sample=None, seed=0):
+    """Build the manual-review packet for a false-positive residual (from
+    generate_ewg_fp_waterfall() or generate_cf_unmatched_fp_analysis()): one
+    plot_cluster_parcel image per candidate (raw NAIP imagery + cluster
+    outline) plus a CSV using the same columns as the existing manual-review
+    log (Date of check, Identifier, lat-long, Parcel_owner1_names, Dataset,
+    Issue/reason for checking, Notes/conclusion) so entries can be pasted
+    straight in.
+
+    Never overwrites an existing review CSV — if fp_manual_review_{label}.csv
+    already exists, this is a no-op (delete it to force regeneration), so a
+    routine pipeline re-run can't clobber completed manual review.
+
+    label: short tag used in output file/folder names (e.g. "ewg" for the
+        full-census EWG-region review, "cf_unmatched" for the CF-sent
+        random sample).
+    n_sample: if given, draw a random subsample of this size (fixed seed)
+        instead of reviewing the full residual — use None to review the
+        full residual (appropriate when the source is treated as a
+        complete census, e.g. the EWG-region waterfall).
+    """
+    out_dir = subdirs["error"] / f"fp_manual_review_{label}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = subdirs["tables"] / f"fp_manual_review_{label}.csv"
+
+    if out_csv.exists():
+        print(f"  {out_csv} already exists — skipping (delete it to force regeneration).")
+        return pd.read_csv(out_csv)
+
+    sample = residual.copy()
+    if n_sample is not None and n_sample < len(sample):
+        sample = sample.sample(n=n_sample, random_state=seed)
+
+    centroids_4326 = sample.geometry.centroid.to_crs(4326)
+    sample["lat"] = centroids_4326.y
+    sample["lon"] = centroids_4326.x
+    sample["lat-long"] = (
+        sample["lat"].round(6).astype(str) + ", " + sample["lon"].round(6).astype(str)
+    )
+
+    rows = []
+    for idx, row in sample.iterrows():
+        ident = str(row["polygon_indices"])
+        safe_ident = ident.replace("[", "").replace("]", "").replace(", ", "-").replace(",", "-")
+        # Large merged clusters can have hundreds of sub-polygon indices,
+        # producing a filename longer than the OS limit (255 bytes) -- fall
+        # back to a short hash of the full identifier in that case.
+        if len(safe_ident) > 150:
+            safe_ident = hashlib.md5(ident.encode()).hexdigest()[:16]
+        fig_path = out_dir / f"{safe_ident}.png"
+        try:
+            pu.plot_cluster_parcel(
+                sample.loc[[idx]],
+                image_bound_map=data["image_bound_map"],
+                zoom_radius=400,
+                include_AU_estimate=True,
+                fig_path=fig_path,
+                fig_format="png",
+                dpi=120,
+            )
+            plt.close("all")
+        except Exception as e:
+            print(f"  Warning: could not plot {ident}: {e}")
+            fig_path = None
+
+        rows.append({
+            "Date of check": "",
+            "Identifier": ident,
+            "lat-long": row["lat-long"],
+            "Parcel_owner1_names": row["parcel_owner1_names"],
+            "Dataset": f"four_band_clusters ({row['source']})",
+            "animal_unit_estimate": row["animal_unit_estimate"],
+            "plot_image": str(fig_path) if fig_path else "",
+            "Issue/reason for checking": "post-processing FP residual — unresolved after automated filters",
+            "Notes/conclusion": "",
+        })
+
+    sample_out = pd.DataFrame(rows)
+    sample_out.to_csv(out_csv, index=False)
+    print(f"  Saved {len(sample_out)}-row manual review sample to {out_csv}")
+    print(f"  Saved {len(sample_out)} cluster/parcel plots to {out_dir}")
+    return sample_out
+
+
+# ============================================================================
+# Section 6c: Manual-review summary statistics (Reviewer #1, Limitation 2)
+# ============================================================================
+#
+# Consumes the human-coded review files, NOT the blank templates generate_
+# fp_manual_review_sample() writes. Workflow: (1) generate the blank samples,
+# (2) fill in "Notes/conclusion" for each row by hand (imagery in the
+# fp_manual_review_{label}/ folders + lat-long for satellite lookup), (3) add
+# a "category" column with one of "farm" / "false_positive" / "ambiguous" per
+# row reflecting the conclusion in Notes/conclusion, (4) save as
+# fp_manual_review_{label}_categorized.csv in tables/, (5) run this function.
+# The categorized files checked into tables/ right now reflect a 20-of-42
+# (EWG) and 20-of-40 (CF) manually reviewed subset; re-running with more rows
+# categorized tightens the confidence intervals below.
+
+def generate_fp_manual_review_summary(subdirs):
+    """Summarize human-coded false-positive/farm/ambiguous determinations for
+    the EWG and CF-unmatched manual-review samples, with Wilson 95% CIs on
+    the false-positive rate, and extrapolate the CF-unmatched rate to its
+    full (un-sampled) residual.
+
+    Writes fp_manual_review_summary.csv to tables/ and prints a copy-paste
+    summary block. Returns the summary DataFrame, or None if the categorized
+    review files aren't present yet (prints instructions in that case).
+    """
+    from statsmodels.stats.proportion import proportion_confint
+
+    ewg_path = subdirs["tables"] / "fp_manual_review_ewg_categorized.csv"
+    cf_path = subdirs["tables"] / "fp_manual_review_cf_unmatched_categorized.csv"
+    if not ewg_path.exists() or not cf_path.exists():
+        print(
+            "  Categorized manual-review files not found "
+            f"({ewg_path.name}, {cf_path.name}). Skipping summary — see "
+            "generate_fp_manual_review_summary()'s docstring for the "
+            "expected workflow/format."
+        )
+        return None
+
+    ewg = pd.read_csv(ewg_path)
+    cf = pd.read_csv(cf_path)
+
+    # CF-unmatched residual size (post milk-license rescue) that the reviewed
+    # 20-row (or however many are categorized) sample was drawn from, for
+    # extrapolation. Recomputed from the waterfall CSV rather than hardcoded.
+    cf_waterfall_path = subdirs["tables"] / "fp_cf_unmatched_waterfall.csv"
+    cf_residual_n = None
+    if cf_waterfall_path.exists():
+        cf_waterfall = pd.read_csv(cf_waterfall_path)
+        cf_residual_n = int(cf_waterfall["n_remaining"].iloc[-1])
+
+    rows = []
+    for label, df in [("ewg", ewg), ("cf_unmatched", cf)]:
+        coded = df[df["category"].isin(["farm", "false_positive", "ambiguous"])]
+        n = len(coded)
+        n_fp = int((coded["category"] == "false_positive").sum())
+        n_farm = int((coded["category"] == "farm").sum())
+        n_amb = int((coded["category"] == "ambiguous").sum())
+        lo, hi = proportion_confint(n_fp, n, method="wilson") if n > 0 else (np.nan, np.nan)
+        row = {
+            "sample": label,
+            "n_reviewed": n,
+            "n_false_positive": n_fp,
+            "n_farm": n_farm,
+            "n_ambiguous": n_amb,
+            "fp_rate": n_fp / n if n > 0 else np.nan,
+            "fp_rate_wilson_ci_low": lo,
+            "fp_rate_wilson_ci_high": hi,
+        }
+        if label == "cf_unmatched" and cf_residual_n is not None:
+            row["extrapolated_residual_n"] = cf_residual_n
+            row["extrapolated_fp_count"] = row["fp_rate"] * cf_residual_n
+            row["extrapolated_fp_count_ci_low"] = lo * cf_residual_n
+            row["extrapolated_fp_count_ci_high"] = hi * cf_residual_n
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    summary.to_csv(subdirs["tables"] / "fp_manual_review_summary.csv", index=False)
+
+    print("\n  Manual review summary (human-coded false positive / farm / ambiguous):")
+    print(summary.to_string(index=False))
+    for row in rows:
+        print(
+            f"\n  {row['sample']}: {row['n_false_positive']}/{row['n_reviewed']} "
+            f"confirmed false positives "
+            f"({100 * row['fp_rate']:.0f}%, Wilson 95% CI "
+            f"[{100 * row['fp_rate_wilson_ci_low']:.0f}%, "
+            f"{100 * row['fp_rate_wilson_ci_high']:.0f}%])"
+        )
+        if "extrapolated_fp_count" in row:
+            print(
+                f"    extrapolated to the full {row['extrapolated_residual_n']}-item "
+                f"residual: ~{row['extrapolated_fp_count']:.0f} false positives "
+                f"[{row['extrapolated_fp_count_ci_low']:.0f}, "
+                f"{row['extrapolated_fp_count_ci_high']:.0f}]"
+            )
+
+    print(f"\n  Saved fp_manual_review_summary.csv to {subdirs['tables']}")
+    return summary
 
 
 # ============================================================================
@@ -685,6 +1106,263 @@ def generate_unpermitted_analysis(data, subdirs, permit_matched, all_clusters=No
 
 
 # ============================================================================
+# Section 8a: Formal permitted vs. unpermitted statistical tests (Reviewer)
+# ============================================================================
+
+def generate_perm_unperm_statistical_tests(all_clusters, subdirs):
+    """Formal hypothesis tests, effect sizes, and CIs for the permitted vs.
+    unpermitted-potential comparisons that are stated descriptively in the text
+    (Section discussing Figure fig:perm_unperm_size / Table
+    tab:permitted_unpermitted_physical).
+
+    Addresses reviewer comment: "The discussion relies on descriptive
+    comparisons. Perform formal tests to determine whether differences between
+    permitted and unpermitted CAFOs are statistically significant; report
+    confidence intervals, hypothesis tests, or effect sizes."
+
+    Produces, all operating on the same `all_clusters['set']` partition that
+    feeds the physical-characteristics table so the numbers are consistent:
+
+      1. Continuous comparisons (footprint area, AU, #parcels, #buildings)
+         between "Permitted dairy CAFOs" and "Unpermitted potential CAFOs":
+         Welch t-test, Mann-Whitney U, Cohen's d, Cliff's delta, a 95% CI on
+         the difference in means, and a bootstrap 95% CI on the ratio of means
+         (backs the "N% smaller footprint" statement).
+      2. Permit rate by AU size bin with Wilson 95% CIs, a Cochran-Armitage
+         trend test and a Spearman rank correlation (backs "permit status is
+         strongly correlated with size"), plus a Fisher exact test contrasting
+         the lowest and highest size bins (backs "12% ... to 91%").
+      3. Descriptive top-300-by-size reframing (backs "64 unpermitted farms
+         would enter the top-size group").
+
+    Writes two CSVs to tables/ and prints a copy-paste-ready summary block.
+    """
+    import scipy.stats as ss
+    from statsmodels.stats.proportion import proportion_confint
+
+    out_tables = subdirs["tables"]
+    PERM, UNP = "Permitted dairy CAFOs", "Unpermitted potential CAFOs"
+
+    df = all_clusters.copy()
+    perm = df[df["set"] == PERM]
+    unp = df[df["set"] == UNP]
+
+    def _cohens_d(a, b):
+        na, nb = len(a), len(b)
+        sp = np.sqrt(
+            ((na - 1) * a.std(ddof=1) ** 2 + (nb - 1) * b.std(ddof=1) ** 2)
+            / (na + nb - 2)
+        )
+        return (a.mean() - b.mean()) / sp if sp > 0 else np.nan
+
+    def _cliffs_delta(U, n1, n2):
+        # Cliff's delta = 2*U/(n1*n2) - 1 (equivalently the rank-biserial
+        # correlation), computed from the Mann-Whitney U statistic.
+        return 2 * U / (n1 * n2) - 1
+
+    def _compare(name, a, b, seed=0, n_boot=10000):
+        """a = permitted values, b = unpermitted-potential values."""
+        a = a.dropna().to_numpy()
+        b = b.dropna().to_numpy()
+        na, nb = len(a), len(b)
+        ma, mb = a.mean(), b.mean()
+
+        t = ss.ttest_ind(a, b, equal_var=False)
+        U = ss.mannwhitneyu(a, b, alternative="two-sided")
+
+        # Welch CI on the difference in means (permitted - unpermitted)
+        va, vb = a.var(ddof=1), b.var(ddof=1)
+        se = np.sqrt(va / na + vb / nb)
+        dfw = se ** 4 / ((va / na) ** 2 / (na - 1) + (vb / nb) ** 2 / (nb - 1))
+        tcrit = ss.t.ppf(0.975, dfw)
+        diff = ma - mb
+        diff_ci = (diff - tcrit * se, diff + tcrit * se)
+
+        # Bootstrap CI on ratio of means (unpermitted / permitted)
+        rng = np.random.default_rng(seed)
+        ratios = np.array([
+            rng.choice(b, nb).mean() / rng.choice(a, na).mean()
+            for _ in range(n_boot)
+        ])
+        r_lo, r_hi = np.percentile(ratios, [2.5, 97.5])
+
+        return {
+            "variable": name,
+            "n_permitted": na,
+            "n_unpermitted": nb,
+            "mean_permitted": ma,
+            "mean_unpermitted": mb,
+            "median_permitted": np.median(a),
+            "median_unpermitted": np.median(b),
+            "mean_diff": diff,
+            "mean_diff_ci_low": diff_ci[0],
+            "mean_diff_ci_high": diff_ci[1],
+            "ratio_unperm_over_perm": mb / ma,
+            "ratio_ci_low": r_lo,
+            "ratio_ci_high": r_hi,
+            "pct_smaller": (1 - mb / ma) * 100,
+            "welch_t": t.statistic,
+            "welch_p": t.pvalue,
+            "mwu_U": U.statistic,
+            "mwu_p": U.pvalue,
+            "cohens_d": _cohens_d(a, b),
+            "cliffs_delta": _cliffs_delta(U.statistic, na, nb),
+        }
+
+    # ── 1. Continuous comparisons ────────────────────────────────────────────
+    comparisons = [
+        ("cluster_area_m2", "Building footprint (m^2)"),
+        ("animal_unit_estimate", "Animal unit estimate (AU)"),
+        ("n_parcels", "Number of land parcels"),
+        ("n_buildings", "Number of buildings"),
+    ]
+    rows = [
+        _compare(label, perm[col], unp[col])
+        for col, label in comparisons
+        if col in df.columns
+    ]
+    cont = pd.DataFrame(rows)
+    cont.to_csv(out_tables / "perm_unperm_statistical_tests.csv", index=False)
+
+    # ── 2. Permit rate by size bin ───────────────────────────────────────────
+    allf = df.copy()
+    allf["is_perm"] = (allf["set"] == PERM).astype(int)
+    bins = [1000, 1500, 2000, 3000, np.inf]
+    labels = ["1000-1500", "1500-2000", "2000-3000", "3000+"]
+    pr_rows = []
+    for lo, hi, lab in zip(bins[:-1], bins[1:], labels):
+        sub = allf[
+            (allf["animal_unit_estimate"] >= lo)
+            & (allf["animal_unit_estimate"] < hi)
+        ]
+        k, n = int(sub["is_perm"].sum()), len(sub)
+        lo_ci, hi_ci = proportion_confint(k, n, method="wilson")
+        pr_rows.append({
+            "au_bin": lab, "n_farms": n, "n_permitted": k,
+            "permit_rate_pct": 100 * k / n,
+            "wilson_ci_low_pct": 100 * lo_ci,
+            "wilson_ci_high_pct": 100 * hi_ci,
+        })
+    pr = pd.DataFrame(pr_rows)
+    pr.to_csv(out_tables / "permit_rate_by_size_ci.csv", index=False)
+
+    # Cochran-Armitage trend test across ordered size bins (scores 0..k-1)
+    scores = np.arange(len(pr_rows))
+    n_i = pr["n_farms"].to_numpy()
+    x_i = pr["n_permitted"].to_numpy()
+    N, R = n_i.sum(), x_i.sum()
+    pbar = R / N
+    T = np.sum(scores * (x_i - n_i * pbar))
+    var = pbar * (1 - pbar) * (
+        np.sum(n_i * scores ** 2) - (np.sum(n_i * scores)) ** 2 / N
+    )
+    z_ca = T / np.sqrt(var)
+    p_ca = 2 * (1 - ss.norm.cdf(abs(z_ca)))
+
+    # Fisher exact: lowest vs highest size bin
+    lowbin = allf[
+        (allf["animal_unit_estimate"] >= 1000)
+        & (allf["animal_unit_estimate"] < 1500)
+    ]
+    highbin = allf[allf["animal_unit_estimate"] >= 3000]
+    table = [
+        [int(lowbin["is_perm"].sum()), len(lowbin) - int(lowbin["is_perm"].sum())],
+        [int(highbin["is_perm"].sum()), len(highbin) - int(highbin["is_perm"].sum())],
+    ]
+    or_fisher, p_fisher = ss.fisher_exact(table)
+
+    # Spearman rank correlation of size vs permit status (farms >= 1000 AU)
+    big = allf[allf["animal_unit_estimate"] >= 1000]
+    rho, p_rho = ss.spearmanr(big["animal_unit_estimate"], big["is_perm"])
+
+    # ── 3. Top-300-by-size reframing ─────────────────────────────────────────
+    n_perm_total = len(perm)
+    top = df.sort_values("animal_unit_estimate", ascending=False).head(n_perm_total)
+    top_composition = top["set"].value_counts()
+    n_unperm_in_top = int(top_composition.get(UNP, 0))
+
+    # % of permitted in the 1000-2000 AU band
+    perm_1000_2000 = perm[
+        (perm["animal_unit_estimate"] >= 1000)
+        & (perm["animal_unit_estimate"] < 2000)
+    ]
+    pct_perm_1000_2000 = 100 * len(perm_1000_2000) / n_perm_total
+
+    # ── Print copy-paste summary ─────────────────────────────────────────────
+    def _p(p):
+        return "p < 0.001" if p < 1e-3 else f"p = {p:.3f}"
+
+    lines = []
+    lines.append("\n" + "=" * 78)
+    lines.append("FORMAL TESTS: permitted vs. unpermitted-potential CAFOs")
+    lines.append("(copy-paste-ready summary; full numbers in "
+                 "tables/perm_unperm_statistical_tests.csv)")
+    lines.append("=" * 78)
+
+    for r in rows:
+        lines.append(f"\n{r['variable']}:")
+        lines.append(
+            f"  permitted   mean={r['mean_permitted']:,.1f} "
+            f"(median {r['median_permitted']:,.1f}), n={r['n_permitted']}"
+        )
+        lines.append(
+            f"  unpermitted mean={r['mean_unpermitted']:,.1f} "
+            f"(median {r['median_unpermitted']:,.1f}), n={r['n_unpermitted']}"
+        )
+        lines.append(
+            f"  diff in means = {r['mean_diff']:,.1f} "
+            f"[95% CI {r['mean_diff_ci_low']:,.1f}, {r['mean_diff_ci_high']:,.1f}]"
+        )
+        lines.append(
+            f"  unpermitted is {r['pct_smaller']:.0f}% smaller "
+            f"(ratio {r['ratio_unperm_over_perm']:.3f} "
+            f"[95% CI {r['ratio_ci_low']:.3f}, {r['ratio_ci_high']:.3f}])"
+        )
+        lines.append(
+            f"  Welch t={r['welch_t']:.2f} ({_p(r['welch_p'])}); "
+            f"Mann-Whitney {_p(r['mwu_p'])}; "
+            f"Cohen's d={r['cohens_d']:.2f}, Cliff's delta={r['cliffs_delta']:.2f}"
+        )
+
+    lines.append("\nPermit rate by size (Wilson 95% CIs):")
+    for r in pr_rows:
+        lines.append(
+            f"  {r['au_bin']} AU: {r['permit_rate_pct']:.1f}% "
+            f"[{r['wilson_ci_low_pct']:.1f}, {r['wilson_ci_high_pct']:.1f}] "
+            f"(n={r['n_farms']})"
+        )
+    lines.append(
+        f"  Cochran-Armitage trend test: z={z_ca:.1f}, {_p(p_ca)}"
+    )
+    lines.append(
+        f"  Fisher exact (1000-1500 vs 3000+): OR={or_fisher:.3f}, {_p(p_fisher)}"
+    )
+    lines.append(
+        f"  Spearman rho(size, permitted | AU>=1000) = {rho:.2f}, "
+        f"{_p(p_rho)} (n={len(big)})"
+    )
+
+    lines.append(
+        f"\nTop {n_perm_total} farms by estimated size: "
+        f"{int(top_composition.get(PERM, 0))} permitted, "
+        f"{n_unperm_in_top} unpermitted potential."
+    )
+    lines.append(
+        f"Permitted CAFOs in 1000-2000 AU band: {len(perm_1000_2000)} "
+        f"({pct_perm_1000_2000:.0f}% of {n_perm_total} permitted)."
+    )
+    lines.append("=" * 78 + "\n")
+
+    summary_text = "\n".join(lines)
+    print(summary_text)
+    (out_tables / "perm_unperm_tests_summary.txt").write_text(summary_text)
+
+    print(f"  Saved perm_unperm_statistical_tests.csv, permit_rate_by_size_ci.csv, "
+          f"perm_unperm_tests_summary.txt to {out_tables}")
+    return cont, pr
+
+
+# ============================================================================
 # Section 8b: Spatial clustering statistics (permitted vs. unpermitted potential)
 # ============================================================================
 
@@ -763,6 +1441,9 @@ INVERT_VARIABLES = [
 ]
 
 
+INTERNAL_PII_CLUSTERS_PATH_NAME = "all_clusters_internal_PII.parquet"
+
+
 def generate_risk_assessment(data, paths, subdirs, skip_imagery=False,
                              precomputed_path=None):
     """Summary table, risk indices, risk figures. → 05_risk_assessment/ + tables/.
@@ -772,6 +1453,14 @@ def generate_risk_assessment(data, paths, subdirs, skip_imagery=False,
         snapmaps and running the expensive summary_table() + distance calculations.
         All downstream risk-index figures are still produced; the summary table CSV
         is skipped in this mode.
+
+    When the full (non-precomputed) path runs, all_clusters — which still carries
+    parcel_owner1_names/2_names from the underlying cluster data — is also cached to
+    tables/all_clusters_internal_PII.parquet. This is a SEPARATE file from the public
+    publication dataset (which never includes parcel owner names) and exists only so
+    generate_online_validation_sample() can look up owner names on a later
+    --use-precomputed (fast) run without redoing this expensive step. Never publish or
+    share this file — it contains PII (parcel owner names).
     """
     out_risk = subdirs["risk"]
     out_tables = subdirs["tables"]
@@ -825,6 +1514,27 @@ def generate_risk_assessment(data, paths, subdirs, skip_imagery=False,
         )
         plt.close("all")
         del snapmaps
+
+        # Cache the parcel-owner-containing clusters (see docstring) — CONTAINS PII.
+        pii_cache_path = out_tables / INTERNAL_PII_CLUSTERS_PATH_NAME
+        try:
+            cache_df = all_clusters.copy()
+            # pd.cut-derived columns (e.g. 'size_category' from sample_and_calc_au)
+            # are IntervalDtype, which pyarrow can't cast to parquet — stringify
+            # any interval/categorical columns before writing.
+            for col in cache_df.columns:
+                if col == cache_df.geometry.name:
+                    continue
+                dtype = cache_df[col].dtype
+                if isinstance(dtype, pd.CategoricalDtype) or "interval" in str(dtype).lower():
+                    cache_df[col] = cache_df[col].astype(str)
+            cache_df.to_parquet(pii_cache_path)
+            print(
+                f"  Cached all_clusters with parcel owner names (INTERNAL — contains "
+                f"PII, do not publish/share) → {pii_cache_path}"
+            )
+        except Exception as e:
+            print(f"  Warning: could not cache internal PII clusters: {e}")
 
     # ── common to both paths ──────────────────────────────────────────────────
     all_clusters["permitted"] = all_clusters["set"] == "Permitted dairy CAFOs"
@@ -1289,6 +1999,348 @@ def generate_milk_license_match_stats(data, subdirs):
 
 
 # ============================================================================
+# Section 11c: 2024 permit update match (out-of-sample confirmation)
+# ============================================================================
+
+PERMIT_2024_DIR_NAME = "wdnr_cafos_2024_aug"
+PERMIT_2024_MATCH_DISTANCE = 400  # metres — matches caf.merge_clusters_permits elsewhere
+
+
+def _load_permits_2024(paths):
+    """Load and clean the updated (Aug 2024) WDNR CAFO Main/Satellite shapefiles.
+
+    Mirrors the cleaning in notebooks/2024_permit_update_analysis.ipynb:
+      - Main: keep only PERMIT_STA == 'Current'.
+      - Satellite: drop rows with the shapefile float-overflow sentinel
+        coordinates used for null geometries.
+      - Combine into one GeoDataFrame with a unique CAFO_index and a
+        SATELLITE_ column (null for main sites), matching data["WDNR_CAFOs"]'s
+        schema closely enough to reuse the same matching logic.
+    """
+    permit_dir = paths["data_path"] / PERMIT_2024_DIR_NAME
+    new_main = gpd.read_file(permit_dir / "CAFO Main.shp")
+    new_sat = gpd.read_file(permit_dir / "CAFO Satellite.shp")
+
+    main_clean = new_main[new_main["PERMIT_STA"] == "Current"].copy()
+    main_clean["SATELLITE_"] = np.nan
+    main_clean = main_clean.rename(
+        columns={"FIN": "Facility ID (FIN)", "PERMITTEE_": "PermitteeName"}
+    )
+
+    COORD_OVERFLOW = 1e20  # shapefile float overflow sentinel for null geometries
+    sat_bounds = new_sat.geometry.bounds
+    sat_clean = new_sat[sat_bounds["minx"].abs() <= COORD_OVERFLOW].copy()
+    sat_clean = sat_clean.rename(columns={"FIN": "Facility ID (FIN)"})
+
+    main_clean["CAFO_index"] = range(len(main_clean))
+    sat_clean["CAFO_index"] = range(len(main_clean), len(main_clean) + len(sat_clean))
+
+    permits_2024 = pd.concat([main_clean, sat_clean], ignore_index=True)
+    permits_2024 = gpd.GeoDataFrame(permits_2024, geometry="geometry", crs=cfg.WI_EPSG)
+    return permits_2024
+
+
+def generate_permit_2024_update_match(data, paths, all_clusters, subdirs):
+    """Re-match unpermitted potential CAFOs against an updated (Aug 2024) WDNR
+    permit shapefile, issued after the paper's original ~2022 permit snapshot.
+
+    Reproduces notebooks/2024_permit_update_analysis.ipynb inside the main
+    pipeline so the match is regenerated from the same in-memory all_clusters
+    used throughout the paper (rather than the static published geojson).
+
+    For each unpermitted potential CAFO (all_clusters['set'] ==
+    'Unpermitted potential CAFOs'), matches to the nearest 2024 permit within
+    400m, preferring a main-site match over a satellite-site match (same
+    logic as caf.merge_clusters_permits). Classifies each match as
+    'genuinely new' (Facility ID not present in the original 2022 permit
+    data) vs. one that should have matched already in the original analysis.
+
+    Writes permit_2024_update_matches.csv to tables/ with the auto-computed
+    match columns plus blank columns for the manual permit-file lookups
+    reported in the paper (approval-time AU, stated expansion AU, approval
+    date, earliest portal document date, link, notes) — same schema as the
+    "2024 permit matched unpermitted detections" Google Sheet tab, so a
+    completed sheet can be dropped back in at this path. Never overwrites an
+    existing CSV (delete it to force a fresh match), so pulling the
+    filled-in sheet back and re-running is safe.
+    """
+    out_csv = subdirs["tables"] / "permit_2024_update_matches.csv"
+    if out_csv.exists():
+        print(f"  {out_csv} already exists — skipping (delete it to force a fresh match).")
+        return pd.read_csv(out_csv)
+
+    permits_2024 = _load_permits_2024(paths)
+    permits_main_2024 = permits_2024[permits_2024["SATELLITE_"].isna()].copy()
+    permits_sat_2024 = permits_2024[permits_2024["SATELLITE_"].notna()].copy()
+
+    old_permits = data["WDNR_CAFOs"]
+    old_main_fins = set(
+        old_permits.loc[old_permits["SATELLITE_"].isna(), "Facility ID (FIN)"]
+        .dropna().astype(int)
+    )
+
+    # Select only the columns needed for matching. all_clusters already carries
+    # a 'Facility ID (FIN)' column from the original 2022 permit match (NaN for
+    # unpermitted rows) — sjoin_nearest would otherwise silently rename both
+    # sides' 'Facility ID (FIN)' to _left/_right on collision with the 2024
+    # permit data's own column of the same name.
+    unpermitted = all_clusters.loc[
+        all_clusters["set"] == "Unpermitted potential CAFOs",
+        ["polygon_indices", "animal_unit_estimate", "animal_units_lower",
+         "animal_units_upper", "geometry"],
+    ].copy()
+    print(f"  Unpermitted potential CAFOs to re-match: {len(unpermitted)}")
+
+    matched_main = unpermitted.sjoin_nearest(
+        permits_main_2024[["Facility ID (FIN)", "PermitteeName", "CAFO_index", "geometry"]],
+        max_distance=PERMIT_2024_MATCH_DISTANCE, distance_col="match_distance", how="left",
+    ).drop(columns=["index_right"], errors="ignore")
+    matched_main["_match_priority"] = 0
+
+    matched_sat = unpermitted.sjoin_nearest(
+        permits_sat_2024[["Facility ID (FIN)", "SATELLITE_", "CAFO_index", "geometry"]],
+        max_distance=PERMIT_2024_MATCH_DISTANCE, distance_col="match_distance", how="left",
+    ).drop(columns=["index_right"], errors="ignore")
+    matched_sat["_match_priority"] = 1
+
+    combined = pd.concat([matched_main, matched_sat])
+    combined["_pstr"] = combined["polygon_indices"].apply(str)
+    combined = combined.sort_values(["_match_priority", "match_distance"])
+    combined = combined.drop_duplicates(subset="_pstr", keep="first").drop(columns=["_pstr"])
+
+    newly_matched = combined[combined["CAFO_index"].notna()].copy()
+    still_unmatched = combined[combined["CAFO_index"].isna()].copy()
+
+    newly_matched["fin_int"] = newly_matched["Facility ID (FIN)"].astype(float).astype("Int64")
+    newly_matched["permit_in_2022"] = newly_matched["fin_int"].apply(
+        lambda f: int(f) in old_main_fins if pd.notna(f) else False
+    )
+    newly_matched["genuinely_new_permit"] = ~newly_matched["permit_in_2022"]
+
+    print(f"  Now matching a 2024 permit (<={PERMIT_2024_MATCH_DISTANCE}m): {len(newly_matched)}")
+    print(
+        f"    Genuinely new permit (issued after 2022):        "
+        f"{int(newly_matched['genuinely_new_permit'].sum())}"
+    )
+    print(
+        f"    FIN existed in 2022 (missed match originally):   "
+        f"{int(newly_matched['permit_in_2022'].sum())}"
+    )
+    print(f"  Still unmatched in 2024:                            {len(still_unmatched)}")
+
+    out = newly_matched.sort_values("match_distance")[[
+        "polygon_indices", "animal_unit_estimate", "animal_units_lower", "animal_units_upper",
+        "Facility ID (FIN)", "PermitteeName", "match_distance", "permit_in_2022",
+        "genuinely_new_permit",
+    ]].copy()
+    out["polygon_indices"] = out["polygon_indices"].apply(str)
+
+    # Blank columns for manual permit-file lookups (matches the Google Sheet
+    # schema used for the manuscript's out-of-sample confirmation appendix).
+    for col in [
+        "Projected expansion (projected) at time of approval",
+        "Current found online at application approval time",
+        "Date created of approved initial permit",
+        "Au at initial app time",
+        "Date created for earliest doc on portal",
+        "Date of imagery",
+        "Link",
+        "notes",
+    ]:
+        out[col] = ""
+
+    out.to_csv(out_csv, index=False)
+    print(f"  Saved {len(out)}-row 2024 permit match table to {out_csv}")
+    return out
+
+
+# ============================================================================
+# Section 11d: Online validation sample (unpermitted potential CAFOs)
+# ============================================================================
+
+VALIDATION_SAMPLE_SEED = 42
+VALIDATION_SAMPLE_N_PER_GROUP = 40
+
+
+def generate_online_validation_sample(data, all_clusters, subdirs,
+                                       n_per_group=VALIDATION_SAMPLE_N_PER_GROUP,
+                                       seed=VALIDATION_SAMPLE_SEED):
+    """Draw a reproducible stratified random sample of unpermitted potential
+    CAFOs for manual online validation, and write a fill-in-the-blanks CSV.
+
+    Stratifies by milk-license match status (all_clusters['matched_milk'],
+    the same 500m sjoin_nearest match used throughout the paper) and draws
+    n_per_group facilities from each stratum of the >=1000 AU unpermitted
+    universe (all_clusters['set'] == 'Unpermitted potential CAFOs'), using a
+    fixed random_state so the draw is identical on every pipeline run.
+
+    Writes online_validation_sample.csv to tables/ with:
+      - identifier (polygon_indices, stable join key back to all_clusters)
+      - milk_license_match_group ('with_milk_license_match' / 'without_...')
+      - lat, lon, lat-long (paste directly into Google Maps/Earth)
+      - parcel_owner1_names, parcel_owner2_names
+      - milk_BusinessName, milk_FarmAddress, milk_TypeofMilk, milk_County,
+        milk_match_distance_m (blank when milk_license_match_group is
+        'without_milk_license_match')
+      - animal_unit_estimate, animal_units_lower, animal_units_upper
+      - three blank columns for manual completion after pulling this into a
+        Google Sheet: 'Confirmed active dairy facility', 'Any information
+        about size available online - sources', 'Online information about
+        herd size - estimate'
+
+    Never overwrites an existing CSV (delete it to force a fresh draw) — a
+    routine pipeline re-run can't clobber a partially/fully filled-in sheet
+    pulled back from Google Sheets. Pair with analyze_online_validation_sample()
+    to read the completed sheet back in for synthesis.
+
+    If all_clusters is missing parcel_owner1_names (e.g. running with
+    --use-precomputed off the public, PII-free publication dataset), this
+    transparently swaps in tables/all_clusters_internal_PII.parquet when that
+    cache exists (written by a prior full run of generate_risk_assessment()),
+    so owner names don't require re-running the expensive summary_table() step.
+    """
+    out_csv = subdirs["tables"] / "online_validation_sample.csv"
+    if out_csv.exists():
+        print(f"  {out_csv} already exists — skipping (delete it to force a fresh draw).")
+        return pd.read_csv(out_csv)
+
+    if "parcel_owner1_names" not in all_clusters.columns:
+        pii_cache_path = subdirs["tables"] / INTERNAL_PII_CLUSTERS_PATH_NAME
+        if pii_cache_path.exists():
+            print(
+                f"  all_clusters has no parcel_owner1_names (likely --use-precomputed) — "
+                f"loading cached internal clusters from {pii_cache_path} instead."
+            )
+            all_clusters = gpd.read_parquet(pii_cache_path)
+        else:
+            print(
+                "  Warning: all_clusters has no parcel_owner1_names and no "
+                f"{pii_cache_path} cache exists — sample will omit parcel owner names. "
+                "Run the pipeline once without --use-precomputed to build the cache."
+            )
+
+    if "matched_milk" not in all_clusters.columns:
+        raise ValueError(
+            "all_clusters is missing 'matched_milk' — run generate_risk_assessment() first."
+        )
+
+    unp = all_clusters[all_clusters["set"] == "Unpermitted potential CAFOs"].copy()
+    with_milk = unp[unp["matched_milk"] == True]
+    without_milk = unp[unp["matched_milk"] == False]
+
+    def _draw(pool, group_label):
+        n = min(n_per_group, len(pool))
+        if n < n_per_group:
+            print(
+                f"  Warning: only {len(pool)} candidates available for '{group_label}' "
+                f"(requested {n_per_group}); using all of them."
+            )
+        drawn = pool.sample(n=n, random_state=seed).copy()
+        drawn["milk_license_match_group"] = group_label
+        return drawn
+
+    drawn_with = _draw(with_milk, "with_milk_license_match")
+    drawn_without = _draw(without_milk, "without_milk_license_match")
+    sample = pd.concat([drawn_with, drawn_without]).copy()
+
+    # Milk-license match details for the sampled rows only (same 500m
+    # threshold used to build 'matched_milk' in summary_table()).
+    milk_wi = data["milk_producers"].to_crs(cfg.WI_EPSG)
+    milk_cols = ["BusinessName", "FarmAddress", "TypeofMilk", "County"]
+    milk_subset = milk_wi[milk_cols + [milk_wi.geometry.name]].rename(
+        columns={c: f"milk_{c}" for c in milk_cols}
+    )
+    sample = sample.sjoin_nearest(
+        milk_subset, max_distance=500, how="left", distance_col="milk_match_distance_m",
+    )
+    sample = sample[~sample.index.duplicated(keep="first")]
+    sample = sample.drop(columns=["index_right"], errors="ignore")
+
+    # Lat/lon centroid in WGS84, pasteable straight into Google Maps/Earth.
+    centroids_4326 = sample.geometry.centroid.to_crs(4326)
+    sample["lat"] = centroids_4326.y
+    sample["lon"] = centroids_4326.x
+    sample["lat-long"] = (
+        sample["lat"].round(6).astype(str) + ", " + sample["lon"].round(6).astype(str)
+    )
+    sample["identifier"] = sample["polygon_indices"].apply(str)
+
+    out_cols = [
+        "identifier", "milk_license_match_group",
+        "lat", "lon", "lat-long",
+        "parcel_owner1_names", "parcel_owner2_names",
+        "milk_BusinessName", "milk_FarmAddress", "milk_TypeofMilk", "milk_County",
+        "milk_match_distance_m",
+        "animal_unit_estimate", "animal_units_lower", "animal_units_upper",
+    ]
+    out_cols = [c for c in out_cols if c in sample.columns]
+    out = pd.DataFrame(sample[out_cols])
+    out["Confirmed active dairy facility"] = ""
+    out["Any information about size available online - sources"] = ""
+    out["Online information about herd size - estimate"] = ""
+
+    # Shuffle row order (fixed seed) so the two strata are interleaved rather
+    # than block-ordered, then reset the index for a clean CSV.
+    out = out.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    out.to_csv(out_csv, index=False)
+    print(
+        f"  Drew {len(drawn_with)} with milk-license match + {len(drawn_without)} without "
+        f"({len(out)} total) → {out_csv}"
+    )
+    return out
+
+
+def analyze_online_validation_sample(subdirs):
+    """Read the completed online-validation CSV (see
+    generate_online_validation_sample()) back in and report confirmation
+    rates by milk-license-match group.
+
+    Prints a reminder and returns without writing anything if the sample
+    hasn't been drawn yet, or hasn't been filled in yet. Expects 'Confirmed
+    active dairy facility' to contain Yes/No-style text; blank/unrecognized
+    values are excluded from the rate calculation (and counted separately)
+    rather than treated as either answer, so partial completion of the
+    Google Sheet doesn't skew the reported rate.
+    """
+    in_csv = subdirs["tables"] / "online_validation_sample.csv"
+    if not in_csv.exists():
+        print(f"  {in_csv} not found — run generate_online_validation_sample() first.")
+        return None
+
+    df = pd.read_csv(in_csv)
+    confirmed_col = "Confirmed active dairy facility"
+    resp = df[confirmed_col].astype(str).str.strip().str.lower()
+    is_yes = resp.isin(["yes", "y", "true", "1"])
+    is_no = resp.isin(["no", "n", "false", "0"])
+    answered = is_yes | is_no
+    n_answered = int(answered.sum())
+
+    if n_answered == 0:
+        print(
+            f"  {in_csv} has no completed rows yet — fill in '{confirmed_col}' "
+            f"(and the other columns) in the pulled-back Google Sheet, then re-run."
+        )
+        return df
+
+    df["_confirmed_active"] = np.where(is_yes, True, np.where(is_no, False, np.nan))
+    summary = df[answered].groupby("milk_license_match_group")["_confirmed_active"].agg(
+        ["mean", "count"]
+    ).rename(columns={"mean": "pct_confirmed_active", "count": "n_answered"})
+    summary["pct_confirmed_active"] *= 100
+
+    overall = df.loc[answered, "_confirmed_active"].mean() * 100
+    print(f"\n  Online validation sample: {n_answered}/{len(df)} rows answered.")
+    print(summary.to_string())
+    print(f"\n  Overall confirmed-active rate: {overall:.1f}%")
+
+    out_path = subdirs["tables"] / "online_validation_summary.csv"
+    summary.to_csv(out_path)
+    print(f"  Saved {out_path}")
+    return df
+
+
+# ============================================================================
 # Section 12: Main orchestrator
 # ============================================================================
 
@@ -1421,6 +2473,31 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
     print("\n=== 4/8: Image Review Stats ===")
     generate_image_review_stats(data, paths, subdirs)
 
+    # 4a. EWG-region false-positive waterfall (Reviewer #1, Limitation 2) —
+    # EWG's census is treated as complete, so the full residual is reviewed.
+    print("\n=== 4a: EWG-Region FP Waterfall ===")
+    _, ewg_fp_residual = generate_ewg_fp_waterfall(data, paths, subdirs)
+
+    # 4b. CF-sent-but-unmatched false positives — only the milk-license
+    # rescue applies (size/urban/keyword were already applied before
+    # sending to CF), so a random sample is manually reviewed instead.
+    print("\n=== 4b: CF-Sent-Unmatched FP Analysis ===")
+    _, cf_fp_residual = generate_cf_unmatched_fp_analysis(data, paths, subdirs)
+
+    if not args.skip_imagery:
+        print("\n=== 4c: FP Manual Review Samples ===")
+        generate_fp_manual_review_sample(
+            data, paths, subdirs, ewg_fp_residual, label="ewg", n_sample=None,
+        )
+        generate_fp_manual_review_sample(
+            data, paths, subdirs, cf_fp_residual, label="cf_unmatched", n_sample=40,
+        )
+
+    # 4d. Summary stats from human-coded review (no-op until *_categorized.csv
+    # files exist — see generate_fp_manual_review_summary()'s docstring).
+    print("\n=== 4d: FP Manual Review Summary ===")
+    generate_fp_manual_review_summary(subdirs)
+
     # 5. Model performance + universe tables
     print("\n=== 5/8: Performance & Universe Tables ===")
     generate_tables(data, subdirs, permit_matched)
@@ -1436,43 +2513,66 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
 
     # 7. Unpermitted analysis — receives all_clusters so permit_rate_by_size uses
     # the same 'set' column as the notebook (from summary_table()).
-    print("\n=== 7/11: Unpermitted Analysis ===")
+    print("\n=== 7/13: Unpermitted Analysis ===")
     generate_unpermitted_analysis(data, subdirs, permit_matched, all_clusters=all_clusters)
+
+    # 7a. Formal tests backing the descriptive permitted-vs-unpermitted claims
+    # in the size-distribution discussion (reviewer: report CIs / hypothesis
+    # tests / effect sizes rather than descriptive comparisons).
+    print("\n=== 7a/13: Permitted vs. Unpermitted Statistical Tests ===")
+    generate_perm_unperm_statistical_tests(all_clusters, subdirs)
 
     # 7b. Descriptive permit-status regression (Reviewer #2): what correlates
     # with holding a permit, net of size, region, and operational factors.
-    print("\n=== 7b/11: Permit-Status Regression ===")
+    print("\n=== 7b/13: Permit-Status Regression ===")
     generate_permit_status_regression(data, all_clusters, paths, subdirs)
+
+    # 7c. Online validation sample: reproducible random draw of unpermitted
+    # potential CAFOs (stratified by milk-license match) for manual
+    # confirmation via Google Maps/online search. Never overwrites an
+    # existing draw, so pulling the filled-in sheet back and re-running is
+    # safe. analyze_online_validation_sample() reports confirmation rates
+    # once the sheet has been filled in.
+    print("\n=== 7c/13: Online Validation Sample ===")
+    generate_online_validation_sample(data, all_clusters, subdirs)
+    analyze_online_validation_sample(subdirs)
 
     # 8. Spatial clustering statistics (join-count/Moran's I, Getis-Ord Gi*,
     # K-function difference, NN cross-statistic) for permitted vs. unpermitted potential.
     if not getattr(args, "skip_spatial_stats", False):
-        print("\n=== 8/11: Spatial Clustering Statistics ===")
+        print("\n=== 8/13: Spatial Clustering Statistics ===")
         generate_spatial_clustering_analysis(
             data, all_clusters, subdirs,
             n_permutations=getattr(args, "spatial_permutations", 999),
         )
     else:
-        print("\n=== 8/11: Spatial Clustering Statistics (skipped) ===")
+        print("\n=== 8/13: Spatial Clustering Statistics (skipped) ===")
 
     # 9. Publication dataset
-    print("\n=== 9/11: Publication Dataset ===")
+    print("\n=== 9/13: Publication Dataset ===")
     generate_publication_dataset(all_clusters, data["milk_producers"], subdirs)
 
     # 10. Milk license match statistics
-    print("\n=== 10/11: Milk License Match Statistics ===")
+    print("\n=== 10/13: Milk License Match Statistics ===")
     generate_milk_license_match_stats(data, subdirs)
+
+    # 10a. Re-match against an updated (Aug 2024) WDNR permit shapefile, issued
+    # after the paper's original ~2022 permit snapshot — out-of-sample
+    # confirmation that some unpermitted potential CAFOs are real, if
+    # previously unrecorded, farms (Section 5.1 of the manuscript).
+    print("\n=== 10a/13: 2024 Permit Update Match ===")
+    generate_permit_2024_update_match(data, paths, all_clusters, subdirs)
 
     # 11. Space-parameter sensitivity (OAT sweeps + welfare scenarios)
     if not getattr(args, "skip_sensitivity", False):
-        print("\n=== 11/11: Space-Parameter Sensitivity ===")
+        print("\n=== 11/13: Space-Parameter Sensitivity ===")
         import sensitivity_space_params as ssp
         ssp.generate_space_param_sensitivity(
             data, subdirs,
             n_workers=getattr(args, "sensitivity_workers", 4),
         )
     else:
-        print("\n=== 11/11: Space-Parameter Sensitivity (skipped) ===")
+        print("\n=== 11/13: Space-Parameter Sensitivity (skipped) ===")
 
 
 if __name__ == "__main__":
