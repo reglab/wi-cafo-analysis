@@ -242,6 +242,85 @@ def _run_one_param_value(param_to_change, value, truncnorm_params, data_dict):
 
 
 # ============================================================================
+# Welfare-based selection (differential mixing) analysis
+# ============================================================================
+
+def _unpermitted_au_estimates(truncnorm_params, data_dict):
+    """Per-farm point-estimate AU for milk-license-matched unpermitted farms.
+
+    The unpermitted set and the milk-license match are both spatial and do not
+    depend on space params, so only the per-farm AU (and thus the ≥1000 crossing)
+    changes across parameter sets. Returns a pd.Series indexed by the facility's
+    native cluster index.
+    """
+    params = copy.deepcopy(truncnorm_params)
+    all_cf = est_au.sample_and_calc_au(
+        data_dict["all_cf_clusters"].copy(),
+        include_area_uncertainty=False,
+        truncnorm_params=params,
+    )
+    all_perm, _ = caf.merge_clusters_permits(
+        all_cf, data_dict["WDNR_CAFOs"],
+        sum_satellite_counts=False, discrep_analysis=False, only_dairy=False,
+    )
+    unpermitted = all_cf[
+        ~all_cf["polygon_indices"].isin(all_perm["polygon_indices"])
+    ].copy()
+    milk_wi = data_dict["milk_producers"].to_crs(cfg.WI_EPSG)
+    unperm_milk = unpermitted.sjoin_nearest(milk_wi, max_distance=500)
+    if "geometry_left" in unperm_milk.columns:
+        unperm_milk["geometry"] = unperm_milk["geometry_left"]
+        unperm_milk.drop(
+            ["geometry_left", "geometry_right"], axis=1, inplace=True, errors="ignore"
+        )
+        unperm_milk = gpd.GeoDataFrame(unperm_milk, geometry="geometry", crs=cfg.WI_EPSG)
+    unperm_milk = unperm_milk[~unperm_milk.index.duplicated(keep="first")]
+    return unperm_milk["animal_unit_estimate"]
+
+
+def _run_welfare_mixing(baseline_params, high_welfare_params, data_dict, out_dir,
+                        phi_grid=None):
+    """Differential welfare-selection sensitivity.
+
+    Holds permitted farms at baseline and shifts a fraction phi of *unpermitted*
+    farms to high-welfare (spacious) housing. Because the unpermitted count
+    depends only on the unpermitted set, the expected count under independent
+    per-farm Bernoulli(phi) assignment is exact:
+        E[count(phi)] = sum_f [(1-phi)*1{AU_base_f >= 1000} + phi*1{AU_high_f >= 1000}]
+    Only two AU passes are needed (baseline + high-welfare).
+
+    Reports only the estimated number of unpermitted potential CAFOs vs. phi.
+    """
+    if phi_grid is None:
+        phi_grid = [round(0.1 * i, 1) for i in range(11)]  # 0.0 .. 1.0
+
+    print("  Welfare mixing: computing unpermitted AU under baseline params...")
+    au_base = _unpermitted_au_estimates(baseline_params, data_dict)
+    print("  Welfare mixing: computing unpermitted AU under high-welfare params...")
+    au_high = _unpermitted_au_estimates(high_welfare_params, data_dict)
+
+    common = au_base.index.intersection(au_high.index)
+    base_ge = (au_base.loc[common] >= 1000).astype(int)
+    high_ge = (au_high.loc[common] >= 1000).astype(int)
+
+    rows = []
+    for phi in phi_grid:
+        expected = float(((1 - phi) * base_ge + phi * high_ge).sum())
+        rows.append({
+            "phi_unpermitted_high_welfare": phi,
+            "expected_unpermitted_cafos": round(expected, 1),
+        })
+        print(f"    phi={phi}: expected unpermitted CAFOs = {expected:.1f}")
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out_dir / "welfare_mixing_results.csv", index=False)
+    print(f"  Saved welfare_mixing_results.csv "
+          f"(phi=0 → {rows[0]['expected_unpermitted_cafos']}, "
+          f"phi=1 → {rows[-1]['expected_unpermitted_cafos']})")
+    return df
+
+
+# ============================================================================
 # Parallel orchestration
 # ============================================================================
 
@@ -520,13 +599,13 @@ def generate_space_param_sensitivity(
     }
 
     # ── 1. OAT sweeps ──────────────────────────────────────────────────────
-    print("\n  [1/2] OAT sweeps...")
+    print("\n  [1/3] OAT sweeps...")
     oat_df = _run_oat_parallel(oat_sweeps, baseline_params, data_dict, n_workers, out)
     _plot_oat_results(oat_df, out)
     print(f"  Saved oat_sweep_results.csv + figures ({len(oat_df)} rows)")
 
     # ── 2. Welfare scenarios ────────────────────────────────────────────────
-    print("\n  [2/2] Welfare scenarios...")
+    print("\n  [2/3] Welfare scenarios...")
     welfare_df = _run_scenarios_parallel(welfare_scenarios, data_dict, n_workers, out)
     _plot_welfare_scenarios(welfare_df, out)
 
@@ -542,9 +621,19 @@ def generate_space_param_sensitivity(
     display_cols = ["scenario"] + KEY_METRICS
     available = [c for c in display_cols if c in welfare_df.columns]
     print(welfare_df[available].to_string(index=False))
+
+    # ── 3. Welfare-based selection (differential mixing) ─────────────────────
+    print("\n  [3/3] Welfare-selection mixing...")
+    high_welfare = welfare_scenarios.get("high_welfare")
+    if high_welfare is None:
+        print("    (skipped — no 'high_welfare' scenario defined)")
+        mixing_df = None
+    else:
+        mixing_df = _run_welfare_mixing(baseline_params, high_welfare, data_dict, out)
+
     print(f"\n  Saved all outputs to {out}")
 
-    return {"oat": oat_df, "welfare": welfare_df}
+    return {"oat": oat_df, "welfare": welfare_df, "mixing": mixing_df}
 
 
 # ============================================================================
@@ -566,6 +655,13 @@ def main():
             "baseline scenario only. Fast end-to-end check before the full grid."
         ),
     )
+    parser.add_argument(
+        "--mixing-only", action="store_true",
+        help=(
+            "Run only the welfare-selection mixing analysis (two AU passes: "
+            "baseline + high-welfare). Fast; outputs welfare_mixing_results.csv."
+        ),
+    )
     args = parser.parse_args()
 
     import matplotlib
@@ -584,7 +680,23 @@ def main():
     print("Loading data (no snapmaps)...")
     data = gpr.load_all_data(paths, read_snapmaps=False)
 
-    if args.test:
+    if args.mixing_only:
+        print("\n[MIXING-ONLY] Welfare-selection differential mixing analysis.")
+        data_dict = {
+            "all_cf_clusters":    data["all_cf_clusters"],
+            "four_band_clusters": data["four_band_clusters"],
+            "WDNR_CAFOs":         data["WDNR_CAFOs"],
+            "counties":           data["counties"],
+            "ewg_afos":           data["ewg_afos"],
+            "milk_producers":     data["milk_producers"],
+        }
+        results = _run_welfare_mixing(
+            BASELINE_TRUNCNORM_PARAMS,
+            WELFARE_SCENARIOS["high_welfare"],
+            data_dict,
+            subdirs["sensitivity"],
+        )
+    elif args.test:
         print("\n[TEST MODE] Running 1 OAT value + baseline scenario only.")
         test_oat = [("mean_milking_cows", [12])]
         test_scenarios = {"baseline": BASELINE_TRUNCNORM_PARAMS}
