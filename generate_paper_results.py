@@ -515,6 +515,83 @@ def generate_image_review_stats(data, paths, subdirs):
     print(f"  Reduction factor: {reduction_factor:.1f}x")
 
 
+def generate_human_annotation_yield_stats(data, paths, subdirs):
+    """Quantify the marginal value of human annotation, conditional on a
+    cluster having already survived model size-filtering and automated
+    post-processing (Reviewer #2: error analysis by pipeline stage).
+
+    Scope matters here: any_images_sent/matched_to_CF_annot cover every
+    historical CloudFactory batch sent over the life of the project, under
+    whatever size/criteria were in effect at the time — not just the
+    current >500 AU decision rule. Computing "fraction sent but not
+    annotated" over that whole history overstates how much human review
+    weeds out *given everything upstream already filtered*, since it
+    includes many small/low-quality historical sends automated filtering
+    would exclude today. This function instead restricts to clusters that
+    pass the CURRENT decision rule (>500 AU) and the same post-processing
+    filters used in generate_ewg_fp_waterfall / generate_image_review_stats
+    (urban-area proximity, parcel-owner keyword, non-dairy-CAFO exclusion),
+    then asks: of what's actually been sent for annotation within that
+    already-filtered population, what fraction came back unconfirmed?
+
+    Writes human_annotation_yield.csv to tables/. Returns the stats
+    DataFrame.
+    """
+    four_band = _add_cf_review_flags(data["four_band_clusters"], data["all_cf_clusters"], paths)
+
+    fb = four_band[four_band["animal_unit_estimate"] > 500].copy()
+    n0 = len(fb)
+
+    urban_areas = gpd.read_file(
+        paths["data_path"].parent / URBAN_AREA_PROXY_PATH
+    ).to_crs(cfg.WI_EPSG)
+    fb = fb.sjoin_nearest(urban_areas[["geometry"]], distance_col="dist_to_urban")
+    fb = fb[~fb.index.duplicated(keep="first")]
+    fb = fb[fb["dist_to_urban"] > 500].copy()
+    fb = fb.drop(columns=["index_right", "dist_to_urban"], errors="ignore")
+
+    exclude_keywords = ["STORAG", "CHEMICAL", "ELECTRONIC", "WOOD"]
+    fb = fb[
+        ~fb["parcel_owner1_names"].apply(lambda x: any(kw in str(x) for kw in exclude_keywords))
+    ].copy()
+
+    nondairy_cafos = data["WDNR_CAFOs"][data["WDNR_CAFOs"]["AnimalType"] != "Dairy"].to_crs(cfg.WI_EPSG)
+    near_nondairy = fb.sjoin_nearest(nondairy_cafos[["geometry"]], max_distance=300, how="inner")
+    nondairy_pstrs = set(near_nondairy["polygon_indices"].apply(str))
+    fb = fb[~fb["polygon_indices"].apply(str).isin(nondairy_pstrs)].copy()
+
+    fb["_pstr"] = fb["polygon_indices"].apply(str)
+    fb = fb.drop_duplicates(subset="_pstr").drop(columns=["_pstr"])
+
+    def _yield_stats(sub, label):
+        sent = sub[sub["any_images_sent"] == True]
+        n_sent = len(sent)
+        n_confirmed = int((sent["matched_to_CF_annot"] == True).sum())
+        n_rejected = int((sent["matched_to_CF_annot"] == False).sum())
+        return {
+            "scope": label,
+            "n_gt500AU_post_processing_passed": len(sub),
+            "n_sent_for_annotation": n_sent,
+            "n_confirmed_dairy": n_confirmed,
+            "n_not_confirmed": n_rejected,
+            "pct_not_confirmed_of_sent": 100 * n_rejected / n_sent if n_sent > 0 else np.nan,
+        }
+
+    rows = [
+        _yield_stats(fb, "statewide"),
+        _yield_stats(fb[fb["ewg_region"] == True], "ewg_region"),
+        _yield_stats(fb[fb["ewg_region"] == False], "outside_ewg_region"),
+    ]
+    stats = pd.DataFrame(rows)
+    stats.to_csv(subdirs["tables"] / "human_annotation_yield.csv", index=False)
+
+    print(f"\n  Clusters >500 AU passing post-processing filters: {n0} -> {len(fb)}")
+    print("\n  Human annotation yield, conditional on prior filtering:")
+    print(stats.to_string(index=False))
+    print(f"\n  Saved human_annotation_yield.csv to {subdirs['tables']}")
+    return stats
+
+
 # ============================================================================
 # Section 6a: False-positive waterfalls (Reviewer #1, Limitation 2)
 # ============================================================================
@@ -2500,6 +2577,10 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
     # 4. Image review stats
     print("\n=== 4/8: Image Review Stats ===")
     generate_image_review_stats(data, paths, subdirs)
+
+    # 4z. Human-annotation yield conditional on prior filtering (Reviewer #2)
+    print("\n=== 4z: Human Annotation Yield ===")
+    generate_human_annotation_yield_stats(data, paths, subdirs)
 
     # 4a. EWG-region false-positive waterfall (Reviewer #1, Limitation 2) —
     # EWG's census is treated as complete, so the full residual is reviewed.

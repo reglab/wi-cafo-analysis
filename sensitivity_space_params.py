@@ -222,8 +222,10 @@ def _run_full_params(scenario_name, truncnorm_params, data_dict):
         "ewg_precision":               recall_500["ewg_precision"].values[0],
         "unpermitted_potential_CAFOs_milk_license_estimate": _count_ge_1000(unperm_milk, "animal_unit_estimate"),
         "unpermitted_potential_CAFOs_milk_license_lower":    _count_ge_1000(unperm_milk, "animal_units_lower"),
+        "unpermitted_potential_CAFOs_milk_license_upper":    _count_ge_1000(unperm_milk, "animal_units_upper"),
         "permitted_CAFOs_meeting_logic_estimate":            _count_ge_1000(permit_matched, "animal_unit_estimate"),
         "permitted_CAFOs_meeting_logic_lower":               _count_ge_1000(permit_matched, "animal_units_lower"),
+        "permitted_CAFOs_meeting_logic_upper":               _count_ge_1000(permit_matched, "animal_units_upper"),
     }
 
 
