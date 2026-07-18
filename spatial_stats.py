@@ -270,6 +270,33 @@ def nn_cross_test(gdf, label_col="permitted", n_permutations=999, seed=None):
     }
 
 
+def _sanitize_for_geojson(gdf):
+    """Return a copy of gdf with anything fiona/GeoJSON can't serialize stringified or dropped.
+
+    all_clusters carries columns from upstream steps (pd.cut size bins, a
+    leftover non-active 'geometry' column from set_geometry("centroid"),
+    list/tuple-valued 'polygon_indices', etc.) that either break fiona's
+    schema inference or fail at write time. Cast defensively rather than
+    special-casing each column by name, since new incompatible columns can
+    show up as upstream code changes.
+    """
+    out = gdf.copy()
+    geom_name = out.geometry.name
+    for col in list(out.columns):
+        if col == geom_name:
+            continue
+        dtype = out[col].dtype
+        if isinstance(dtype, gpd.array.GeometryDtype):
+            out = out.drop(columns=col)
+        elif isinstance(dtype, pd.CategoricalDtype) or "interval" in str(dtype).lower():
+            out[col] = out[col].astype(str)
+        elif dtype == object and out[col].apply(
+            lambda v: isinstance(v, (list, tuple, dict, set))
+        ).any():
+            out[col] = out[col].astype(str)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -342,7 +369,8 @@ def run_spatial_clustering_analysis(all_clusters, out_dir=None, k=8, n_permutati
         with open(out_dir / "spatial_clustering_stats.json", "w") as f:
             json.dump(results, f, indent=2)
 
-        gi_star_gdf.to_file(out_dir / "gi_star_hotspots.geojson", driver="GeoJSON")
+        gi_star_out = _sanitize_for_geojson(gi_star_gdf)
+        gi_star_out.to_file(out_dir / "gi_star_hotspots.geojson", driver="GeoJSON")
 
         _plot_k_function_difference(k_diff, out_dir / "k_function_difference.svg")
         _plot_gi_star_map(gi_star_gdf, county_data, out_dir / "gi_star_hotspot_map.svg")

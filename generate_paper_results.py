@@ -1884,6 +1884,11 @@ def _generate_risk_case_studies(all_clusters, data, out_risk):
             cluster_to_plot = all_clusters[
                 all_clusters["polygon_indices"].apply(lambda x: x == row["polygon_indices"])
             ]
+            # all_clusters' active geometry is 'centroid' (points), swapped in by
+            # analyze_water_pollution_stats — plot_cluster_parcel draws .boundary/.plot()
+            # on whatever's active, so without this reset it silently plots empty point
+            # boundaries instead of the actual cluster polygon outline/fill.
+            cluster_to_plot = cluster_to_plot.set_geometry("geometry")
             plot_kwargs = dict(
                 image_bound_map=data["image_bound_map"],
                 parcel_data=data["parcels"],
@@ -2188,6 +2193,10 @@ def generate_permit_2024_update_match(data, paths, all_clusters, subdirs):
         ["polygon_indices", "animal_unit_estimate", "animal_units_lower",
          "animal_units_upper", "geometry"],
     ].copy()
+    # .loc[] keeps all_clusters' active-geometry pointer (upstream code swaps it to
+    # 'centroid' via set_geometry), which isn't among the selected columns above —
+    # reset it explicitly or sjoin_nearest below fails to resolve .geometry/.crs.
+    unpermitted = unpermitted.set_geometry("geometry")
     print(f"  Unpermitted potential CAFOs to re-match: {len(unpermitted)}")
 
     matched_main = unpermitted.sjoin_nearest(
