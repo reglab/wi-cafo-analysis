@@ -2097,6 +2097,17 @@ def summary_table(
 
     plot_size_unperm_vs_perm(all_clusters, save_path=size_plot_m2_save_path, column="cluster_area_m2")
 
+    # Preserve the cluster's actual polygon footprint before analyze_water_pollution_stats()
+    # below resets the active geometry to the cluster centroid (needed for its water-table-depth
+    # and SNAPmaps zone-assignment joins). The milk-producer license join needs the real facility
+    # footprint, not the centroid: for a large, multi-building CAFO the centroid can sit >500m from
+    # a milk producer's geocoded point even when the nearest barn is well within 500m.
+    cluster_footprints = gpd.GeoDataFrame(
+        {"polygon_indices": all_clusters["polygon_indices"].values},
+        geometry=all_clusters.geometry.values,
+        crs=all_clusters.crs,
+    )
+
     # This function actually adds all the variables at facility-level indicating distance to various water-related areas/relevant dummy variables
     all_clusters = caf.analyze_water_pollution_stats(
         all_clusters,
@@ -2107,8 +2118,9 @@ def summary_table(
         snapmaps_layers,
     )
     all_clusters.reset_index(drop=True, inplace=True)
-    # Join clusters with milk producer data
-    all_clusters_matched_milk = all_clusters.sjoin_nearest(
+    # Join clusters with milk producer data, using the facility's actual polygon footprint
+    # (not the centroid left active by analyze_water_pollution_stats() above)
+    all_clusters_matched_milk = cluster_footprints.sjoin_nearest(
         milk_producers.to_crs(cfg.WI_EPSG), max_distance=500
     )
     # polygon_indices are lists (unhashable), so .isin() fails silently.
