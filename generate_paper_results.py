@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -70,6 +71,18 @@ def apply_paper_style():
 # Section 1: Path setup
 # ============================================================================
 
+# Git-tracked (unlike paper_results/ and data/, both gitignored) snapshots of
+# manually-reviewed data pulled from the "WI-CAFO manual review" Google Sheet:
+# https://docs.google.com/spreadsheets/d/1O6pTQbB1CIEnODzpIPL42p_O_Y1WDx7v44UA0_Yq5bw
+# Each file holds only the human-judgment columns (join key + reviewer inputs),
+# not the auto-computed columns the pipeline regenerates itself. A full clean
+# rerun (even from an empty paper_results/) reconstructs the complete tables by
+# merging its own fresh computation with these checked-in review snapshots —
+# to refresh a snapshot, re-download the relevant sheet tab and overwrite the
+# matching file here.
+MANUAL_REVIEW_DIR = Path("manual_review")
+
+
 def setup_paths():
     """Load config and create output directory structure."""
     with open("config/config.yml", "r") as f:
@@ -95,6 +108,7 @@ def setup_paths():
         "risk": output_base / "05_risk_assessment",
         "sensitivity": output_base / "06_space_param_sensitivity",
         "spatial": output_base / "07_spatial_clustering",
+        "uncertainty_propagation": output_base / "08_uncertainty_propagation",
         "tables": output_base / "tables",
         "pub_dataset": output_base / "publication_dataset",
     }
@@ -924,10 +938,23 @@ def generate_fp_manual_review_summary(subdirs):
 
     ewg_path = subdirs["tables"] / "fp_manual_review_ewg_categorized.csv"
     cf_path = subdirs["tables"] / "fp_manual_review_cf_unmatched_categorized.csv"
+
+    # Restore from the git-tracked review snapshot (see MANUAL_REVIEW_DIR
+    # docstring) if a clean/fresh paper_results/ doesn't have these yet —
+    # these categorized files are human judgment, not pipeline-computed, so
+    # they can't be regenerated any other way.
+    for path in (ewg_path, cf_path):
+        if not path.exists():
+            snapshot_path = MANUAL_REVIEW_DIR / path.name
+            if snapshot_path.exists():
+                shutil.copy(snapshot_path, path)
+                print(f"  Restored {path} from {snapshot_path}")
+
     if not ewg_path.exists() or not cf_path.exists():
         print(
             "  Categorized manual-review files not found "
-            f"({ewg_path.name}, {cf_path.name}). Skipping summary — see "
+            f"({ewg_path.name}, {cf_path.name}), and no snapshot in "
+            f"{MANUAL_REVIEW_DIR}/ either. Skipping summary — see "
             "generate_fp_manual_review_summary()'s docstring for the "
             "expected workflow/format."
         )
@@ -1021,9 +1048,14 @@ def generate_tables(data, subdirs, permit_matched):
     # Unpermitted universe table: counts of unpermitted vs permitted > 1000 AU
     # across all AU estimate logic columns, with milk producer match breakdown.
 
-    # Match to ANY permit (including non-dairy, no satellite aggregation)
+    # Match to ANY permit (including non-dairy, no satellite aggregation).
+    # drop_multi_matches=False to match the "unpermitted potential CAFOs"
+    # definition used everywhere else in the pipeline (summary_table() in
+    # create_figures.py, spatial clustering, the 2024 permit rematch) — the
+    # default (True) silently drops multi-matched clusters from the matched
+    # set, over-counting the unpermitted universe by 1 (399 instead of 398).
     all_permit_matched, _ = caf.merge_clusters_permits(
-        data["all_cf_clusters"], data["WDNR_CAFOs"],
+        data["all_cf_clusters"], data["WDNR_CAFOs"], drop_multi_matches=False,
         sum_satellite_counts=False, discrep_analysis=False, only_dairy=False,
     )
     unpermitted_cf = data["all_cf_clusters"][
@@ -1131,6 +1163,7 @@ def generate_unpermitted_analysis(data, subdirs, permit_matched, all_clusters=No
     all_permit_matched, _ = caf.merge_clusters_permits(
         data["all_cf_clusters"], data["WDNR_CAFOs"],
         sum_satellite_counts=False, discrep_analysis=False, only_dairy=False,
+        drop_multi_matches=False,
     )
     unpermitted_cf = data["all_cf_clusters"][
         ~data["all_cf_clusters"]["polygon_indices"].isin(
@@ -1478,7 +1511,61 @@ def generate_spatial_clustering_analysis(data, all_clusters, subdirs, k=8, n_per
         county_data=data["counties"],
     )
     plt.close("all")
+
+    _generate_county_breakdown(data["counties"], out, alpha=0.05)
+
     return results
+
+
+def _generate_county_breakdown(county_data, out, alpha=0.05):
+    """County-level breakdown of the Getis-Ord Gi* hot/cold spots, plus the
+    Spearman test of whether raw facility count predicts permit rate across
+    counties (the "not simply a byproduct of dairy density" check in
+    Section~\\ref{results:spatial_clustering}).
+
+    Reads gi_star_hotspots.geojson (just written by run_spatial_clustering_analysis
+    above, in the same call) rather than recomputing Gi* — this used to be a
+    disconnected, manually-produced table (paper_results/07_spatial_clustering/
+    county_breakdown.csv sat undated/stale for weeks while everything else in
+    this function was regenerated fresh); this makes it a real pipeline step.
+
+    Writes county_breakdown.csv (per-county n_total/n_permitted/pct_permitted/
+    n_hot_unperm/n_cold_perm) and county_correlation_stats.csv (the Spearman
+    rho/p/n) to the same output directory.
+    """
+    import scipy.stats as ss
+
+    gi_star_gdf = gpd.read_file(out / "gi_star_hotspots.geojson")
+    gi_star_gdf = gi_star_gdf.set_geometry("geometry").to_crs(cfg.WI_EPSG)
+    counties = county_data.to_crs(cfg.WI_EPSG)
+
+    joined = gi_star_gdf.sjoin_nearest(counties[["COUNTY_NAM", "geometry"]], how="left")
+    joined = joined[~joined.index.duplicated(keep="first")]
+
+    joined["is_hot"] = (joined["gi_star_z"] > 0) & (joined["gi_star_p_sim"] < alpha)
+    joined["is_cold"] = (joined["gi_star_z"] < 0) & (joined["gi_star_p_sim"] < alpha)
+
+    agg = joined.groupby("COUNTY_NAM").agg(
+        n_total=("permitted", "size"),
+        n_permitted=("permitted", "sum"),
+        n_hot_unperm=("is_hot", "sum"),
+        n_cold_perm=("is_cold", "sum"),
+    ).reset_index()
+    agg["pct_permitted"] = 100 * agg["n_permitted"] / agg["n_total"]
+    agg = agg.sort_values("n_total", ascending=False)
+    agg.to_csv(out / "county_breakdown.csv", index=False)
+
+    agg5 = agg[agg["n_total"] >= 5]
+    rho, p = ss.spearmanr(agg5["n_total"], agg5["pct_permitted"])
+    corr_stats = pd.DataFrame([{"spearman_rho": rho, "p_value": p, "n_counties": len(agg5)}])
+    corr_stats.to_csv(out / "county_correlation_stats.csv", index=False)
+
+    print(f"  Saved county_breakdown.csv ({len(agg)} counties)")
+    print(
+        f"  County-level facility-count vs. permit-rate correlation: "
+        f"Spearman rho={rho:.3f}, p={p:.3f}, n={len(agg5)} counties (>=5 facilities)"
+    )
+    return agg, corr_stats
 
 
 # ============================================================================
@@ -1662,6 +1749,8 @@ def generate_risk_assessment(data, paths, subdirs, skip_imagery=False,
     risk_var_stats.to_csv(out_tables / "risk_index_summary_stats.csv")
     print(f"  Saved risk_index_summary_stats.csv")
 
+    _save_threshold_adjacent_risk_pair(all_clusters, out_tables)
+
     # Risk index by AU category figures
     cf.plot_risk_index_by_au_category(
         all_clusters, "hand_built_risk_index",
@@ -1838,6 +1927,61 @@ def _centroid_latlon(row):
     return centroid.y, centroid.x  # lat, lon
 
 
+def _save_threshold_adjacent_risk_pair(all_clusters, out_tables):
+    """Find and save the most striking real illustrative pair of
+    threshold-adjacent facilities for the "similar risk, different permit
+    status" discussion in Section~\\ref{results}: the highest-risk unpermitted
+    AFO just below the 1,000 AU permitting threshold, and the lowest-risk
+    permitted CAFO just above it.
+
+    Writes threshold_adjacent_risk_pair.csv (2 rows, no owner-identifying
+    columns — only AU estimate and risk index) to tables/, so the manuscript's
+    illustrative numbers are recomputed fresh every run instead of hand-picked
+    once and left to go stale as the underlying clustering/AU estimates change.
+    """
+    unp_band = all_clusters[
+        (all_clusters["set"] == "AFOs between 500 and 1000 AU")
+        & (all_clusters["animal_unit_estimate"] >= 900)
+        & (all_clusters["animal_unit_estimate"] < 1000)
+    ]
+    perm_band = all_clusters[
+        (all_clusters["set"] == "Permitted dairy CAFOs")
+        & (all_clusters["animal_unit_estimate"] >= 1000)
+        & (all_clusters["animal_unit_estimate"] < 1100)
+    ]
+    if unp_band.empty or perm_band.empty:
+        print(
+            "  Warning: no facilities in one of the 900-1000/1000-1100 AU bands "
+            "-- skipping threshold_adjacent_risk_pair.csv"
+        )
+        return None
+
+    unp_row = unp_band.loc[unp_band["hand_built_risk_index"].idxmax()]
+    perm_row = perm_band.loc[perm_band["hand_built_risk_index"].idxmin()]
+
+    out = pd.DataFrame([
+        {
+            "role": "unpermitted_high_risk",
+            "animal_unit_estimate": unp_row["animal_unit_estimate"],
+            "hand_built_risk_index": unp_row["hand_built_risk_index"],
+        },
+        {
+            "role": "permitted_low_risk",
+            "animal_unit_estimate": perm_row["animal_unit_estimate"],
+            "hand_built_risk_index": perm_row["hand_built_risk_index"],
+        },
+    ])
+    out.to_csv(out_tables / "threshold_adjacent_risk_pair.csv", index=False)
+    print(
+        f"  Saved threshold_adjacent_risk_pair.csv "
+        f"(unpermitted {unp_row['animal_unit_estimate']:.0f} AU, risk "
+        f"{unp_row['hand_built_risk_index']:.2f} vs. permitted "
+        f"{perm_row['animal_unit_estimate']:.0f} AU, risk "
+        f"{perm_row['hand_built_risk_index']:.2f})"
+    )
+    return out
+
+
 def _generate_risk_case_studies(all_clusters, data, out_risk):
     """Print data + save plot for four fixed risk-comparison facilities.
 
@@ -1889,10 +2033,14 @@ def _generate_risk_case_studies(all_clusters, data, out_risk):
             # on whatever's active, so without this reset it silently plots empty point
             # boundaries instead of the actual cluster polygon outline/fill.
             cluster_to_plot = cluster_to_plot.set_geometry("geometry")
+            # Clean image for the manuscript: just the NAIP tile + scale bar, no
+            # facility-footprint outline and no parcel boundary overlay.
             plot_kwargs = dict(
                 image_bound_map=data["image_bound_map"],
                 parcel_data=data["parcels"],
                 annotate_parcels=False,
+                show_parcel_outline=False,
+                show_cluster_outline=False,
                 zoom_radius=500,
                 show_scale_bar=True,
                 display=False,
@@ -1901,9 +2049,6 @@ def _generate_risk_case_studies(all_clusters, data, out_risk):
             )
             if not is_permitted:
                 plot_kwargs["permit_data"] = data["WDNR_CAFOs"]
-            else:
-                plot_kwargs["show_cluster_outline"] = True
-                plot_kwargs["cluster_fill"] = True
             pu.plot_cluster_parcel(cluster_to_plot, **plot_kwargs)
             plt.close("all")
         except Exception as e:
@@ -2243,9 +2388,13 @@ def generate_permit_2024_update_match(data, paths, all_clusters, subdirs):
     ]].copy()
     out["polygon_indices"] = out["polygon_indices"].apply(str)
 
-    # Blank columns for manual permit-file lookups (matches the Google Sheet
-    # schema used for the manuscript's out-of-sample confirmation appendix).
-    for col in [
+    # Manual permit-file lookup columns (approval-time AU, stated expansion,
+    # dates, etc.), merged in from the checked-in review snapshot rather than
+    # left blank — see MANUAL_REVIEW_DIR docstring above. Facility ID (FIN) is
+    # a stable WDNR identifier independent of any re-clustering, so it's a
+    # safe join key even if polygon_indices values have since shifted.
+    review_path = MANUAL_REVIEW_DIR / "permit_2024_update_review.csv"
+    review_cols = [
         "Projected expansion (projected) at time of approval",
         "Current found online at application approval time",
         "Date created of approved initial permit",
@@ -2254,8 +2403,17 @@ def generate_permit_2024_update_match(data, paths, all_clusters, subdirs):
         "Date of imagery",
         "Link",
         "notes",
-    ]:
-        out[col] = ""
+    ]
+    if review_path.exists():
+        review = pd.read_csv(review_path)
+        out = out.merge(review, on="Facility ID (FIN)", how="left")
+        print(f"  Merged manual review data from {review_path} "
+              f"({review['Facility ID (FIN)'].notna().sum()} rows)")
+    else:
+        print(f"  Warning: {review_path} not found — leaving review columns blank. "
+              "See MANUAL_REVIEW_DIR docstring to add it.")
+        for col in review_cols:
+            out[col] = ""
 
     out.to_csv(out_csv, index=False)
     print(f"  Saved {len(out)}-row 2024 permit match table to {out_csv}")
@@ -2333,23 +2491,55 @@ def generate_online_validation_sample(data, all_clusters, subdirs,
         )
 
     unp = all_clusters[all_clusters["set"] == "Unpermitted potential CAFOs"].copy()
-    with_milk = unp[unp["matched_milk"] == True]
-    without_milk = unp[unp["matched_milk"] == False]
+    unp["identifier"] = unp["polygon_indices"].apply(str)
 
-    def _draw(pool, group_label):
-        n = min(n_per_group, len(pool))
-        if n < n_per_group:
+    # If a review snapshot already lists specific facility identifiers (see
+    # MANUAL_REVIEW_DIR docstring above), pin the sample to those exact
+    # facilities instead of drawing fresh ones. A fresh stratified draw is
+    # NOT reproducible across runs once matched_milk (or anything else the
+    # draw stratifies/pools on) changes upstream — e.g. a matched_milk fix
+    # shifts which facilities fall in the with/without pools, so `pool.sample
+    # (random_state=seed)` silently picks a different 80 facilities even with
+    # the same seed, orphaning any manual review tied to the old identifiers.
+    # Pinning by identifier keeps the connection to completed manual review
+    # work while still recomputing every other column fresh.
+    review_path = MANUAL_REVIEW_DIR / "online_validation_review.csv"
+    review = pd.read_csv(review_path) if review_path.exists() else None
+
+    if review is not None and len(review) > 0:
+        sample = unp[unp["identifier"].isin(review["identifier"])].copy()
+        n_missing = len(review) - len(sample)
+        if n_missing > 0:
             print(
-                f"  Warning: only {len(pool)} candidates available for '{group_label}' "
-                f"(requested {n_per_group}); using all of them."
+                f"  Warning: {n_missing} of {len(review)} previously-sampled identifiers "
+                f"from {review_path} were not found in the current unpermitted-potential "
+                "universe (upstream clustering/thresholds may have changed) — dropped."
             )
-        drawn = pool.sample(n=n, random_state=seed).copy()
-        drawn["milk_license_match_group"] = group_label
-        return drawn
+        sample["milk_license_match_group"] = np.where(
+            sample["matched_milk"], "with_milk_license_match", "without_milk_license_match"
+        )
+        print(
+            f"  Restored the {len(sample)}-facility sample pinned to identifiers in "
+            f"{review_path} (not a fresh draw — see docstring)."
+        )
+    else:
+        with_milk = unp[unp["matched_milk"] == True]
+        without_milk = unp[unp["matched_milk"] == False]
 
-    drawn_with = _draw(with_milk, "with_milk_license_match")
-    drawn_without = _draw(without_milk, "without_milk_license_match")
-    sample = pd.concat([drawn_with, drawn_without]).copy()
+        def _draw(pool, group_label):
+            n = min(n_per_group, len(pool))
+            if n < n_per_group:
+                print(
+                    f"  Warning: only {len(pool)} candidates available for '{group_label}' "
+                    f"(requested {n_per_group}); using all of them."
+                )
+            drawn = pool.sample(n=n, random_state=seed).copy()
+            drawn["milk_license_match_group"] = group_label
+            return drawn
+
+        drawn_with = _draw(with_milk, "with_milk_license_match")
+        drawn_without = _draw(without_milk, "without_milk_license_match")
+        sample = pd.concat([drawn_with, drawn_without]).copy()
 
     # Milk-license match details for the sampled rows only (same 500m
     # threshold used to build 'matched_milk' in summary_table()).
@@ -2383,33 +2573,82 @@ def generate_online_validation_sample(data, all_clusters, subdirs,
     ]
     out_cols = [c for c in out_cols if c in sample.columns]
     out = pd.DataFrame(sample[out_cols])
-    out["Confirmed active dairy facility"] = ""
-    out["Any information about size available online - sources"] = ""
-    out["Online information about herd size - estimate"] = ""
+
+    # Manual online-review columns, merged in from the checked-in review
+    # snapshot (already loaded above) rather than left blank — see
+    # MANUAL_REVIEW_DIR docstring. 'identifier' is the same join key used to
+    # pin the sample itself above.
+    review_cols = [
+        "Confirmed active dairy facility",
+        "Any information about size available online - sources",
+        "Online information about herd size - estimate",
+        "Notes",
+    ]
+    if review is not None:
+        out = out.merge(review, on="identifier", how="left")
+        n_matched = out["identifier"].isin(review["identifier"]).sum()
+        print(f"  Merged manual review data from {review_path} "
+              f"({n_matched}/{len(out)} rows matched by identifier)")
+    else:
+        print(f"  Warning: {review_path} not found — leaving review columns blank. "
+              "See MANUAL_REVIEW_DIR docstring to add it.")
+        for col in review_cols:
+            out[col] = ""
 
     # Shuffle row order (fixed seed) so the two strata are interleaved rather
     # than block-ordered, then reset the index for a clean CSV.
     out = out.sample(frac=1, random_state=seed).reset_index(drop=True)
 
     out.to_csv(out_csv, index=False)
+    n_with = int((out["milk_license_match_group"] == "with_milk_license_match").sum())
+    n_without = int((out["milk_license_match_group"] == "without_milk_license_match").sum())
     print(
-        f"  Drew {len(drawn_with)} with milk-license match + {len(drawn_without)} without "
+        f"  {n_with} with milk-license match + {n_without} without "
         f"({len(out)} total) → {out_csv}"
     )
     return out
 
 
+def _categorize_online_validation_response(value):
+    """Map a free-text 'Confirmed active dairy facility' review response to
+    one of the four categories in table:manual_validation_summary (see
+    Appendix "Manual online validation of unpermitted detections"):
+      - confirmed_dairy   ("Yes")
+      - calf_rearing       ("Calf-rearing operation (not a milking herd)")
+      - unclear_cattle     ("Unclear, but appears to be a cattle operation")
+      - confirmed_non_dairy ("Confirmed non-dairy (false positive)")
+    Matching is prefix-based (case-insensitive) on the reviewer's free-text
+    conclusion, e.g. "No - hog and swine operation" -> confirmed_non_dairy.
+    Returns None for blank/unrecognized text (row not yet reviewed, or a
+    conclusion that doesn't fit the four categories).
+    """
+    v = str(value).strip().lower()
+    if v in ("", "nan"):
+        return None
+    if v == "yes":
+        return "confirmed_dairy"
+    if v.startswith("calf"):
+        return "calf_rearing"
+    if v.startswith("unclear"):
+        return "unclear_cattle"
+    if v.startswith("no"):
+        return "confirmed_non_dairy"
+    return None
+
+
 def analyze_online_validation_sample(subdirs):
     """Read the completed online-validation CSV (see
-    generate_online_validation_sample()) back in and report confirmation
-    rates by milk-license-match group.
+    generate_online_validation_sample()) back in and reproduce
+    table:manual_validation_summary — the reviewed/confirmed-dairy/
+    calf-rearing/unclear/false-positive breakdown by milk-license-match
+    group, plus the overall "N of 25 confirmed" statistic reported in prose.
 
     Prints a reminder and returns without writing anything if the sample
-    hasn't been drawn yet, or hasn't been filled in yet. Expects 'Confirmed
-    active dairy facility' to contain Yes/No-style text; blank/unrecognized
-    values are excluded from the rate calculation (and counted separately)
-    rather than treated as either answer, so partial completion of the
-    Google Sheet doesn't skew the reported rate.
+    hasn't been drawn yet, or hasn't been filled in yet. Rows whose response
+    doesn't parse into one of the four known categories (see
+    _categorize_online_validation_response) are excluded from all counts
+    and reported separately, so partial/malformed review data doesn't skew
+    the reported rates.
     """
     in_csv = subdirs["tables"] / "online_validation_sample.csv"
     if not in_csv.exists():
@@ -2418,33 +2657,54 @@ def analyze_online_validation_sample(subdirs):
 
     df = pd.read_csv(in_csv)
     confirmed_col = "Confirmed active dairy facility"
-    resp = df[confirmed_col].astype(str).str.strip().str.lower()
-    is_yes = resp.isin(["yes", "y", "true", "1"])
-    is_no = resp.isin(["no", "n", "false", "0"])
-    answered = is_yes | is_no
-    n_answered = int(answered.sum())
+    df["_category"] = df[confirmed_col].apply(_categorize_online_validation_response)
+    categorized = df[df["_category"].notna()].copy()
+    n_categorized = len(categorized)
 
-    if n_answered == 0:
+    if n_categorized == 0:
         print(
             f"  {in_csv} has no completed rows yet — fill in '{confirmed_col}' "
             f"(and the other columns) in the pulled-back Google Sheet, then re-run."
         )
         return df
 
-    df["_confirmed_active"] = np.where(is_yes, True, np.where(is_no, False, np.nan))
-    summary = df[answered].groupby("milk_license_match_group")["_confirmed_active"].agg(
-        ["mean", "count"]
-    ).rename(columns={"mean": "pct_confirmed_active", "count": "n_answered"})
-    summary["pct_confirmed_active"] *= 100
+    n_uncategorized = int(df[confirmed_col].notna().sum()) - n_categorized
+    if n_uncategorized > 0:
+        print(f"  Warning: {n_uncategorized} filled-in rows didn't match a known "
+              "response category — excluded from the summary below.")
 
-    overall = df.loc[answered, "_confirmed_active"].mean() * 100
-    print(f"\n  Online validation sample: {n_answered}/{len(df)} rows answered.")
+    categories = ["confirmed_dairy", "calf_rearing", "unclear_cattle", "confirmed_non_dairy"]
+    summary = (
+        categorized.groupby(["milk_license_match_group", "_category"]).size()
+        .unstack(fill_value=0).reindex(columns=categories, fill_value=0)
+    )
+    summary = summary.reindex(["with_milk_license_match", "without_milk_license_match"])
+
+    # "Confirmed dairy or closely related cattle operation" = everything
+    # except the confirmed false positives (matches the "23 of 25 (92%)"
+    # prose statistic — confirmed_dairy + calf_rearing + unclear_cattle).
+    is_confirmed_related = categorized["_category"] != "confirmed_non_dairy"
+    n_confirmed_related = int(is_confirmed_related.sum())
+    pct_confirmed_related = 100 * n_confirmed_related / n_categorized
+
+    print(f"\n  Online validation sample: {n_categorized}/{len(df)} rows reviewed and categorized.")
     print(summary.to_string())
-    print(f"\n  Overall confirmed-active rate: {overall:.1f}%")
+    print(f"\n  Confirmed dairy/closely-related cattle operation: "
+          f"{n_confirmed_related}/{n_categorized} ({pct_confirmed_related:.0f}%)")
 
     out_path = subdirs["tables"] / "online_validation_summary.csv"
     summary.to_csv(out_path)
-    print(f"  Saved {out_path}")
+
+    overall_path = subdirs["tables"] / "online_validation_overall.csv"
+    pd.DataFrame([{
+        "n_categorized": n_categorized,
+        "n_confirmed_related": n_confirmed_related,
+        "pct_confirmed_related": pct_confirmed_related,
+        "n_with_public_size_info": int(
+            df["Online information about herd size - estimate"].notna().sum()
+        ),
+    }]).to_csv(overall_path, index=False)
+    print(f"  Saved {out_path}, {overall_path}")
     return df
 
 
@@ -2681,6 +2941,17 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
     print("\n=== 10a/13: 2024 Permit Update Match ===")
     generate_permit_2024_update_match(data, paths, all_clusters, subdirs)
 
+    # 10b. Uncertainty propagation: decision-rule percentile sweep + threshold
+    # classification accuracy against permitted-CAFO ground truth. Was written
+    # (threshold_uncertainty_analysis.py) with the same data/subdirs signature
+    # as every other pipeline step but never actually wired into this
+    # function — its outputs sat stale for weeks while everything else here
+    # was regenerated fresh. Needs no snapmaps, so safe to run regardless of
+    # --skip-snapmaps.
+    print("\n=== 10b/13: Uncertainty Propagation ===")
+    import threshold_uncertainty_analysis as tua
+    tua.generate_uncertainty_propagation_analysis(data, subdirs)
+
     # 11. Space-parameter sensitivity (OAT sweeps + welfare scenarios)
     if not getattr(args, "skip_sensitivity", False):
         print("\n=== 11/13: Space-Parameter Sensitivity ===")
@@ -2691,6 +2962,17 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
         )
     else:
         print("\n=== 11/13: Space-Parameter Sensitivity (skipped) ===")
+
+    # 12. Auto-updating manuscript inputs -- manuscript_inputs/ (flat, no
+    # subfolders, per the journal's submission requirement): 20 tables +
+    # constants.tex (~215 inline \newcommand macros) + every figure
+    # revised_manuscript/main_reproducible.tex references, all regenerated
+    # fresh from whatever is currently in paper_results/ every full run.
+    # Copy manuscript_inputs/ wholesale into the Overleaf project root
+    # (alongside main_reproducible.tex) to refresh the manuscript.
+    print("\n=== 12/13: Manuscript Inputs (tables + constants + figures) ===")
+    import generate_manuscript_inputs as gmi
+    gmi.generate_manuscript_inputs(paths, subdirs)
 
 
 if __name__ == "__main__":

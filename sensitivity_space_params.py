@@ -188,7 +188,7 @@ def _run_full_params(scenario_name, truncnorm_params, data_dict):
 
     # Unpermitted clusters (any permit type, no satellite aggregation)
     all_perm, _ = caf.merge_clusters_permits(
-        all_cf, data_dict["WDNR_CAFOs"],
+        all_cf, data_dict["WDNR_CAFOs"], drop_multi_matches=False,
         sum_satellite_counts=False, discrep_analysis=False, only_dairy=False,
     )
     unpermitted = all_cf[
@@ -262,7 +262,7 @@ def _unpermitted_au_estimates(truncnorm_params, data_dict):
         truncnorm_params=params,
     )
     all_perm, _ = caf.merge_clusters_permits(
-        all_cf, data_dict["WDNR_CAFOs"],
+        all_cf, data_dict["WDNR_CAFOs"], drop_multi_matches=False,
         sum_satellite_counts=False, discrep_analysis=False, only_dairy=False,
     )
     unpermitted = all_cf[

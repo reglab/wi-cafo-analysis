@@ -462,6 +462,7 @@ def plot_cluster_parcel(
     fig_format: str = None,
     show_scale_bar: bool = False,
     show_cluster_outline: bool = True,
+    show_parcel_outline: bool = True,
 ):
     """
     Input:
@@ -491,6 +492,8 @@ def plot_cluster_parcel(
             automatically calculated based on zoom_radius. Default False.
         show_cluster_outline: whether or not to display the cluster boundary outline. Default True.
             When True, clusters are plotted with red outline by default (or cluster_color if specified).
+        show_parcel_outline: whether or not to draw the parcel boundary outline (blue). Default True.
+            Independent of annotate_parcels, which only controls the owner-name text labels.
 
     Returns:
     Plots of shapes in the clusters, optionally along with our animal estimate
@@ -557,7 +560,7 @@ def plot_cluster_parcel(
         jpeg_names, bands=imagery_bands, bounds=bounds
     )
     rasterio.plot.show(naip_image, transform=transform, ax=ax)
-    if parcel_data.shape[0] > 0:
+    if parcel_data.shape[0] > 0 and (annotate_parcels or show_parcel_outline):
         # make sure that the parcel_index is of type int
         parcel_inds = list(
             set(
@@ -583,7 +586,8 @@ def plot_cluster_parcel(
                 ),
                 axis=1,
             )
-        parcel_to_plot.boundary.plot(ax=ax, color="blue")
+        if show_parcel_outline:
+            parcel_to_plot.boundary.plot(ax=ax, color="blue")
 
     # Plot cluster boundaries with red outline by default
     if show_cluster_outline:

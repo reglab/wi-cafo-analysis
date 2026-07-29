@@ -61,7 +61,7 @@ def _milk_matched_unpermitted(all_cf, WDNR_CAFOs, milk_producers):
     """Unpermitted clusters matched to a milk-producer license (same logic used
     throughout the pipeline, e.g. generate_paper_results.py / sensitivity_space_params.py)."""
     all_perm, _ = caf.merge_clusters_permits(
-        all_cf, WDNR_CAFOs,
+        all_cf, WDNR_CAFOs, drop_multi_matches=False,
         sum_satellite_counts=False, discrep_analysis=False, only_dairy=False,
     )
     unpermitted = all_cf[

@@ -15,4 +15,8 @@ wicafo/
 *.egg-info/
 manuscript_latex/
 CLAUDE.md
+manuscript_inputs/
+revised_manuscript/
+notebooks/
+manual_review/
 
