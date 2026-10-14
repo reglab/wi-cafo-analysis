@@ -346,6 +346,16 @@ def plot_permit_v_estimate(
     dpi: float = 300,
     display: bool = True,
     fig_format: str = None,
+    show_corr_annotation: bool = True,
+    diagonal_label_mode: str = "legend",
+    point_color: str = None,
+    marker_size: float = None,
+    uncertainty_color: str = None,
+    uncertainty_alpha: float = 0.5,
+    uncertainty_linewidth: float = 1,
+    strip_spines: bool = False,
+    tick_label_size: float = None,
+    axis_label_size: float = None,
 ):
     """
     Input:
@@ -365,6 +375,17 @@ def plot_permit_v_estimate(
         ax: Optional, existing figure axis to plot on.
         dpi: what dpi to use if saving figure
         display: whether or not to display figure after running
+        show_corr_annotation: whether to draw the in-plot "Correlation coefficient = ..."
+            text box. Set False when that stat is already stated in surrounding prose.
+        diagonal_label_mode: "legend" (default, boxed legend) or "inline" (label placed
+            directly on the estimate=permit reference line, no legend box).
+        point_color, marker_size: optional overrides for the scatter point style.
+        uncertainty_color, uncertainty_alpha, uncertainty_linewidth: optional overrides
+            for the vertical uncertainty bars, so they can be de-emphasized relative to
+            the point estimates.
+        strip_spines: if True, hides the top/right axis spines.
+        tick_label_size, axis_label_size: optional font size overrides, for compact
+            layouts where the default matplotlib sizes are too large.
     Returns: A plot of the permit animal count vs estimated animal count from our analysis
     """
     clusters_to_plot = matched_clusters.dropna(
@@ -391,24 +412,39 @@ def plot_permit_v_estimate(
             color="red"
         )
     else:
+        plot_kwargs = {}
+        if point_color is not None:
+            plot_kwargs["color"] = point_color
+        if marker_size is not None:
+            plot_kwargs["markersize"] = marker_size
         ax.plot(
             clusters_to_plot["Number ofAnimalUnits"],
             clusters_to_plot["animal_unit_estimate"],
-            "."
+            ".",
+            zorder=2,
+            **plot_kwargs,
         )
 
     if include_uncertainty:
+        vline_kwargs = {"linewidth": uncertainty_linewidth, "alpha": uncertainty_alpha, "zorder": 1}
+        if uncertainty_color is not None:
+            vline_kwargs["color"] = uncertainty_color
         ax.vlines(
             clusters_to_plot["Number ofAnimalUnits"],
             clusters_to_plot["animal_units_lower"],
             clusters_to_plot["animal_units_upper"],
-            linewidth=1,
-            alpha=0.5,
+            **vline_kwargs,
         )
-    ax.axline((0, 0), slope=1, linestyle="--", color="black", label="estimate=permit")
 
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
+    diagonal_label = "estimate=permit" if diagonal_label_mode == "legend" else None
+    ax.axline((0, 0), slope=1, linestyle="--", color="black", linewidth=1, label=diagonal_label, zorder=1)
+    if diagonal_label_mode == "inline":
+        corner = min(xlims[1], ylims[1]) * 0.97
+        ax.text(corner, corner, "estimate = permit", rotation=45, rotation_mode="anchor",
+                ha="right", va="bottom", fontsize=tick_label_size or 8, color="black")
+
+    ax.set_xlabel(xlabel, fontsize=axis_label_size)
+    ax.set_ylabel(ylabel, fontsize=axis_label_size)
 
     if discrep_data is not None:
         mean_discrep = discrep_data["mean_discrep"].iloc[0]
@@ -420,13 +456,19 @@ def plot_permit_v_estimate(
     ax.set_ylim(ylims[0], ylims[1])
     ax.set_xlim(xlims[0], xlims[1])
     ax.grid(False)
-    if include_legend:
+    if tick_label_size is not None:
+        ax.tick_params(labelsize=tick_label_size, length=3)
+    if strip_spines:
+        for sp in ["top", "right"]:
+            ax.spines[sp].set_visible(False)
+    if include_legend and diagonal_label_mode == "legend":
         plt.legend()
 
     # Calculate and display R-squared
-    corr_coef = np.corrcoef(clusters_to_plot["Number ofAnimalUnits"], clusters_to_plot["animal_unit_estimate"])[0, 1]
-    ax.text(0.95, 0.05, f"Correlation coefficient = {corr_coef:.2f}", transform=ax.transAxes, fontsize=12,
-            verticalalignment='bottom', horizontalalignment='right', bbox=dict(facecolor='white', alpha=0.5))
+    if show_corr_annotation:
+        corr_coef = np.corrcoef(clusters_to_plot["Number ofAnimalUnits"], clusters_to_plot["animal_unit_estimate"])[0, 1]
+        ax.text(0.95, 0.05, f"Correlation coefficient = {corr_coef:.2f}", transform=ax.transAxes, fontsize=12,
+                verticalalignment='bottom', horizontalalignment='right', bbox=dict(facecolor='white', alpha=0.5))
 
     plt.tight_layout()
     if fig_save_path is not None:

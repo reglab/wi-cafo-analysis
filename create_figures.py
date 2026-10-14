@@ -12,7 +12,6 @@ import matplotlib
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 import matplotlib.font_manager as fm
-from labellines import labelLines
 
 import pandas as pd
 import numpy as np
@@ -1811,36 +1810,52 @@ def facility_level_pr_lowerbound_graph(model_clusters,
     
     # Plot the results
 
-    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    fig, ax = plt.subplots(figsize=(6.0, 3.8))
 
-    # Plot the curves — labels are placed inline via labelLines, not in a legend
-    label_x = AFO_lower_bound_threshes[-3] if len(AFO_lower_bound_threshes) >= 3 else AFO_lower_bound_threshes[-1]
-    lines = []
-    for y_vals, label, ls in [
-        (permit_recalls,    "Permitted CAFO recall",           "-"),
-        (ewg_large_recalls, "EWG large farm recall",           "-"),
-        (ewg_precisions,    "Precision: any farm, EWG region", "--"),
-        (ewg_medium_recalls,"EWG medium farm recall",          "-"),
-        (ewg_small_recalls, "EWG small farm recall",           "-"),
-    ]:
-        (line,) = ax.plot(AFO_lower_bound_threshes, y_vals, linewidth=2, linestyle=ls, label=label)
-        lines.append(line)
+    # Labels are placed at each line's right terminus rather than mid-course via
+    # labelLines: with a flatter, more compact aspect ratio, mid-course labels
+    # sitting close to a neighboring line visually cut through it. End labels get
+    # a small opaque halo (so they stay legible without severing any line) and a
+    # manual vertical dodge when two lines end close together.
+    series = [
+        (permit_recalls,    "Permitted CAFO recall",             "-"),
+        (ewg_large_recalls, "EWG large farm recall",             "-"),
+        (ewg_precisions,    "Precision: any farm,\nEWG region",  "--"),
+        (ewg_medium_recalls,"EWG medium farm recall",            "-"),
+        (ewg_small_recalls, "EWG small farm recall",             "-"),
+    ]
+    end_pts = []
+    for y_vals, label, ls in series:
+        (line,) = ax.plot(AFO_lower_bound_threshes, y_vals, linewidth=1.6, linestyle=ls, label=label)
+        end_pts.append([label, line.get_color(), y_vals[-1]])
 
-    labelLines(lines, xvals=[label_x] * len(lines), fontsize=9.5,
-               yoffsets=0.04, bbox={"pad": 1, "alpha": 0})
+    end_pts.sort(key=lambda r: r[2])
+    min_gap = 0.06
+    for i in range(1, len(end_pts)):
+        if end_pts[i][2] - end_pts[i - 1][2] < min_gap:
+            end_pts[i][2] = end_pts[i - 1][2] + min_gap
+
+    x_end = AFO_lower_bound_threshes[-1]
+    for label, color, y_dodged in end_pts:
+        ax.annotate(label, xy=(x_end, y_dodged), xytext=(6, 0), textcoords="offset points",
+                    fontsize=7, color=color, va="center", ha="left", clip_on=False,
+                    bbox=dict(boxstyle="square,pad=0.05", fc="white", ec="none", alpha=0.85))
 
     # Chosen threshold line
     ax.axvline(500, color="grey", linewidth=0.8, linestyle="--")
-    ax.text(500, 1.02, "Chosen threshold", color="grey",
-            ha="center", va="bottom", fontsize=8.5,
+    ax.text(500, 1.03, "Chosen\nthreshold", color="grey",
+            ha="center", va="bottom", fontsize=7,
             transform=ax.get_xaxis_transform(), clip_on=False)
 
-    ax.set_xlabel("Minimum Animal Unit Threshold To Keep Detections")
-    ax.set_ylabel("Recall or Precision")
-    ax.set_yticks([round(i * 0.1, 1) for i in range(11)])
-    ax.set_xticks(AFO_lower_bound_threshes)
+    ax.set_xlabel("Minimum Animal Unit Threshold To Keep Detections", fontsize=8.5)
+    ax.set_ylabel("Recall or Precision", fontsize=8.5)
+    ax.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_xticks(AFO_lower_bound_threshes[::2])
+    ax.set_xlim(AFO_lower_bound_threshes[0], x_end * 1.3)
+    ax.tick_params(labelsize=7.5, length=3)
     ax.grid(False)
-    ax.tick_params(length=4)
+    for sp in ["top", "right"]:
+        ax.spines[sp].set_visible(False)
 
     plt.tight_layout()
 
@@ -3249,7 +3264,7 @@ def plot_risk_index_by_au_category(all_clusters: gpd.GeoDataFrame,
     ]
     x = np.arange(len(categories))
 
-    fig, ax = plt.subplots(figsize=(8, 5.5))
+    fig, ax = plt.subplots(figsize=(5.0, 3.6))
     alpha = 0.5
 
     # Two series: permitted (teal) and unpermitted (yellow), spanning all AU categories.
@@ -3286,11 +3301,11 @@ def plot_risk_index_by_au_category(all_clusters: gpd.GeoDataFrame,
             if len(vals) > 0:
                 jitter = rng_jitter.uniform(-0.08, 0.08, size=len(vals))
                 ax.scatter(i + offset + jitter, vals, color=color,
-                           alpha=0.15, s=8, linewidths=0, zorder=1)
+                           alpha=0.12, s=6, linewidths=0, zorder=1)
 
         ax.vlines(x + offset, y_low, y_high, color=color, alpha=0.9, linewidth=2, zorder=3)
         ax.scatter(x + offset, y_means, color=color, alpha=1.0,
-                   edgecolor="black", s=70, label=label, zorder=4)
+                   edgecolor="black", s=45, label=label, zorder=4)
 
 
     # CAFO threshold line
@@ -3302,21 +3317,22 @@ def plot_risk_index_by_au_category(all_clusters: gpd.GeoDataFrame,
     if threshold_x is not None:
         ax.axvline(threshold_x, color=cfg.COLOR_THRESHOLD_LINE, linestyle="--", linewidth=cfg.FIG_LINEWIDTH)
         ax.text(threshold_x + 0.03, 0.95,
-                "Permit threshold", color=cfg.COLOR_THRESHOLD_LINE, va="top", fontsize=10,
+                "Permit threshold", color=cfg.COLOR_THRESHOLD_LINE, va="top", fontsize=8.5,
                 transform=ax.get_xaxis_transform())
 
     pretty_name = risk_col.replace("_", " ").title()
     ax.set_xticks(x)
-    ax.set_xticklabels(category_labels, ha="right", rotation=30)
-    ax.set_xlabel("Animal Unit Category")
-    ax.set_ylabel(f"Mean {pretty_name}")
+    ax.set_xticklabels(category_labels, ha="right", rotation=30, fontsize=7.5)
+    ax.set_xlabel("Animal Unit Category", fontsize=8.5)
+    ax.set_ylabel(f"Mean {pretty_name}", fontsize=8.5)
     y_min = max(0, risk_data[risk_col].quantile(0.01) - 0.05)
     y_max = min(1, risk_data[risk_col].quantile(0.99) + 0.05)
     ax.set_ylim(y_min, y_max)
+    ax.tick_params(axis="y", labelsize=7.5, length=3)
     ax.grid(False)
     ax.xaxis.grid(True, color="#cccccc", linewidth=0.6, linestyle=":", zorder=0)
     for sp in ["top", "right"]: ax.spines[sp].set_visible(False)
-    ax.legend(frameon=True, fontsize=cfg.FIG_LEGEND_SIZE, loc="upper right")
+    ax.legend(frameon=False, fontsize=7, loc="upper right")
     plt.tight_layout()
 
     if save_path is not None:
@@ -3651,9 +3667,9 @@ def plot_top_300_breakdown(all_clusters: gpd.GeoDataFrame,
     tot_perm = [300 - u for u in tot_unperm]
     tot_unperm_no_milk = [u - m for u, m in zip(tot_unperm, tot_unperm_milk)]
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(5.4, 3.4))
     x_pos = range(len(rel_weights))
-    width = 0.6
+    width = 0.65
 
     ax.bar(x_pos, tot_perm, width, label="Permitted", color=cfg.COLOR_PERMITTED, alpha=cfg.ALPHA_FILL)
     ax.bar(x_pos, tot_unperm_no_milk, width, bottom=tot_perm,
@@ -3662,14 +3678,18 @@ def plot_top_300_breakdown(all_clusters: gpd.GeoDataFrame,
            bottom=[p + u for p, u in zip(tot_perm, tot_unperm_no_milk)],
            label="Unpermitted (with milk license)", color=cfg.COLOR_UNPERMITTED_MILK, alpha=cfg.ALPHA_MILK_LICENSE)
 
-    ax.set_xlabel("Relative Weight of Size")
-    ax.set_ylabel("Number of Farms in Top 300")
+    ax.set_xlabel("Relative Weight of Size", fontsize=8.5)
+    ax.set_ylabel("Number of Farms in Top 300", fontsize=8.5)
     #ax.set_title("Breakdown of Top 300 Farms Using Combined Size and Hand-Built Risk Index")
     ax.set_xticks(x_pos)
-    ax.set_xticklabels(rel_weights)
+    ax.set_xticklabels(rel_weights, fontsize=7.5)
+    ax.tick_params(axis="y", labelsize=7.5, length=3)
     ax.grid(False)
     for sp in ["top", "right"]: ax.spines[sp].set_visible(False)
-    ax.legend(frameon=True, fontsize=cfg.FIG_LEGEND_SIZE)
+    leg = ax.legend(frameon=True, fontsize=6.8, loc="upper left", bbox_to_anchor=(0.0, 1.02))
+    leg.get_frame().set_facecolor("white")
+    leg.get_frame().set_alpha(0.9)
+    leg.get_frame().set_edgecolor("0.7")
     ax.set_ylim(0, 300)
 
     plt.tight_layout()

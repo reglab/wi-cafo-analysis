@@ -416,11 +416,13 @@ def _plot_gi_star_map(gi_star_gdf, county_data, save_path, alpha=0.05):
     import matplotlib.pyplot as plt
     import config.config_params as cfg
 
-    fig, ax = plt.subplots(figsize=(7, 7))
+    fig, ax = plt.subplots(figsize=(4.6, 4.6))
 
+    county_data_proj = None
     if county_data is not None:
-        county_data.to_crs(cfg.WI_EPSG).plot(
-            ax=ax, edgecolor="black", linewidth=1, color="lightgray", alpha=0.2,
+        county_data_proj = county_data.to_crs(cfg.WI_EPSG)
+        county_data_proj.plot(
+            ax=ax, edgecolor="black", linewidth=0.6, color="0.92", alpha=1.0,
         )
 
     c = gi_star_gdf.geometry.centroid
@@ -429,19 +431,34 @@ def _plot_gi_star_map(gi_star_gdf, county_data, save_path, alpha=0.05):
     cold = sig & (gi_star_gdf["gi_star_z"] < 0)
     nonsig = ~sig
 
-    ax.scatter(c[nonsig].x, c[nonsig].y, c="lightgray", s=6,
+    ax.scatter(c[nonsig].x, c[nonsig].y, c="lightgray", s=4, linewidths=0,
                label=f"Not significant (n={nonsig.sum()})")
-    ax.scatter(c[hot].x, c[hot].y, c=cfg.COLOR_UNPERMITTED, s=14,
+    ax.scatter(c[hot].x, c[hot].y, c=cfg.COLOR_UNPERMITTED, s=10, linewidths=0,
                label=f"Unpermitted-heavy hot spot (n={hot.sum()})")
-    ax.scatter(c[cold].x, c[cold].y, c=cfg.COLOR_PERMITTED, s=14,
+    ax.scatter(c[cold].x, c[cold].y, c=cfg.COLOR_PERMITTED, s=10, linewidths=0,
                label=f"Permitted-heavy cold spot (n={cold.sum()})")
+
+    # Crop tightly to the counties' bounding box (+ small pad) instead of relying
+    # on autoscale, which otherwise leaves a wide margin of empty space around WI.
+    if county_data_proj is not None:
+        minx, miny, maxx, maxy = county_data_proj.total_bounds
+        padx, pady = (maxx - minx) * 0.02, (maxy - miny) * 0.02
+        ax.set_xlim(minx - padx, maxx + padx)
+        ax.set_ylim(miny - pady, maxy + pady)
 
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.legend(loc="lower left", frameon=True)
+    # Inset legend with a solid backing -- stays within the map's own bounding
+    # box (doesn't widen the figure canvas the way an outside/below legend
+    # does) while remaining legible over the "not significant" points.
+    leg = ax.legend(loc="lower left", frameon=True, fontsize=7,
+                     markerscale=1.2, handletextpad=0.3, borderpad=0.5)
+    leg.get_frame().set_facecolor("white")
+    leg.get_frame().set_alpha(0.9)
+    leg.get_frame().set_edgecolor("0.7")
 
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=cfg.FIG_DPI, format=cfg.FIG_EXPORT_FORMAT)
+    plt.tight_layout(pad=0.2)
+    plt.savefig(save_path, dpi=cfg.FIG_DPI, format=cfg.FIG_EXPORT_FORMAT, bbox_inches="tight")
     plt.close(fig)
 
 

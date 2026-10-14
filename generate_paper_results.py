@@ -198,6 +198,18 @@ def generate_model_validation(data, subdirs):
         include_uncertainty=True,
         color_satellite_summed=False,
         fig_save_path=out / "permit_v_estimate_all_clusters.svg",
+        figsize=(4.3, 4.0),
+        display=False,
+        show_corr_annotation=False,
+        diagonal_label_mode="inline",
+        point_color=cfg.COLOR_PERMITTED,
+        marker_size=4,
+        uncertainty_color="0.4",
+        uncertainty_alpha=0.35,
+        uncertainty_linewidth=0.8,
+        strip_spines=True,
+        tick_label_size=8.5,
+        axis_label_size=9.5,
     )
     plt.close("all")
 
