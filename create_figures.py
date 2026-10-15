@@ -2805,89 +2805,68 @@ def unperm_universe_table(
 
     return all_counts
 
-def get_labeled_images(how="csv", data_path=None):
+def get_labeled_images(how="csv", csv_path=None, submissions_dir=None):
     """
-    Get all labeled images from the CF annotations folder.
+    Get all images that were sent to CloudFactory for labeling.
     Args:
-        how (str): How to get the labeled images. Either "csv" or "json".
-        data_path (str): Path to the data folder.
+        how (str): "csv" reads the published all_labeled_images.csv; "json"
+            rebuilds it from the raw CloudFactory submission folders (raw data,
+            not distributed).
+        csv_path: path to all_labeled_images.csv (default: cfg.PATHS.all_labeled_images).
+        submissions_dir: folder of per-submission raw_jsons (only for how="json").
     Returns:
         all_labeled_images (pd.DataFrame): DataFrame containing all labeled images.
     """
-    # Check if how is either "csv" or "json"
     if how not in ["csv", "json"]:
         raise ValueError("how must be either 'csv' or 'json'")
 
-    # Check if data_path is provided
-    if data_path is None:
-        raise ValueError("data_path must be provided")
-    # Check if data_path is a valid path
-    if not os.path.exists(data_path):
-        raise ValueError(f"{data_path} does not exist")
-    
-
-    ## Either get through CSV
     if how == "csv":
-        # Read the CSV file
-        all_labeled_images = pd.read_csv(data_path / "Annotations/all_labeled_images.csv")
-   
-    else:
+        csv_path = Path(csv_path or cfg.PATHS.all_labeled_images)
+        if not csv_path.exists():
+            raise FileNotFoundError(
+                f"{csv_path} not found. Run `python download_data.py` (see README)."
+            )
+        return pd.read_csv(csv_path)
 
-        # Try and reconstruct all_labeled_images but just using json files in the annotations folder
+    if submissions_dir is None or not os.path.exists(submissions_dir):
+        raise ValueError("submissions_dir must point to the raw CloudFactory submissions")
+    base_dir = submissions_dir
+    data = []
+    for batch_name in sorted(os.listdir(base_dir)):
+        batch_path = os.path.join(base_dir, batch_name, 'raw_jsons')
+        if os.path.isdir(batch_path):
+            for file_name in sorted(os.listdir(batch_path)):
+                if file_name.endswith(".json"):
+                    image_name = file_name.replace(".json", ".jpeg")
+                    buffered = image_name.startswith("buffered_")
+                    if buffered:
+                        image_name = image_name.replace("buffered_", "", 1)
+                    if not image_name.startswith("WI_"):
+                        image_name = f"WI_{image_name}"
+                    data.append((image_name, batch_name, buffered))
+    return pd.DataFrame(data, columns=['Image name', 'CF submission', 'buffered?'])
 
-        # Define the base directory
-        base_dir = data_path / "Annotations/Annotations by submission"
-
-        # Initialize a list to store the data
-        data = []
-
-        # Loop through each batch (sorted for reproducibility)
-        for batch_name in sorted(os.listdir(base_dir)):
-            batch_path = os.path.join(base_dir, batch_name, 'raw_jsons')
-
-            if os.path.isdir(batch_path):  # Ensure it's a directory
-                # Loop through each image file (sorted for reproducibility)
-                for file_name in sorted(os.listdir(batch_path)):
-                    if file_name.endswith(".json"):
-                        image_name = file_name.replace(".json", ".jpeg")
-
-                        # Check if image_name starts with 'buffered_'
-                        buffered = image_name.startswith("buffered_")
-                        
-                        # Remove 'buffered_' prefix if present
-                        if buffered:
-                            image_name = image_name.replace("buffered_", "", 1)
-                        
-                        
-                        # Check if the image_name has the 'WI_' prefix
-                        if not image_name.startswith("WI_"):
-                            image_name = f"WI_{image_name}"
-                        
-                        # Append to the list
-                        data.append((image_name, batch_name, buffered))
-
-        # Create a dataframe
-        all_labeled_images = pd.DataFrame(data, columns=['Image name', 'CF submission', 'buffered?'])
-
-    return all_labeled_images
-
-def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, model_prediction_path, read_snapmaps=True, snapmaps_feather=True):
+def load_data(P=None, read_snapmaps=True):
+    """Load every input dataset. `P` is a config_params.DataPaths (default cfg.PATHS)."""
+    P = P or cfg.PATHS
 
     # Load image bound map
-    image_bound_map = gpd.read_file(analysis_output_path / "image_bound_map.geojson")
+    image_bound_map = gpd.read_file(P.image_bound_map)
     # Load county boundary shapefile
-    counties = gpd.read_file(
-        data_path / "geospatial/county_boundaries/County_Boundaries_24K.shp"
-    )
+    counties = gpd.read_file(P.county_boundaries)
     counties["train_counties"] = counties["COUNTY_NAM"].isin(cfg.EWG_COUNTIES)
-    # Load land parcels
-    parcels = cluster.load_parcels(
-        land_parcel_path / "WI_parcels.feather", feather=True
-    )
+    # Land parcels (WI SCO, not distributed). Only the NAIP case-study plots
+    # use them, so a missing file is not fatal.
+    if P.parcels.exists():
+        parcels = cluster.load_parcels(P.parcels, feather=True)
+    else:
+        print(f"  Note: land parcels not found at {P.parcels}; "
+              "parcel overlays on imagery figures will be skipped.")
+        parcels = gpd.GeoDataFrame()
 
     # Load milk producers
     milk_producers = gpd.read_file(
-        data_path / "milk_producers.geojson", driver="GeoJSON"
+        P.milk_producers, driver="GeoJSON"
     )
     # Coalesce manual geocoded locations with automatic geocoded locations
     milk_producers["location"] = milk_producers.apply(
@@ -2904,26 +2883,26 @@ def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, m
 
     # Load known CAFO locations
     WDNR_CAFOs = gpd.read_file(
-        data_path / "WDNR_CAFOs.geojson", driver="GeoJSON", crs=cfg.WI_EPSG
+        P.wdnr_cafos, driver="GeoJSON", crs=cfg.WI_EPSG
     )
     if not WDNR_CAFOs.sindex:
         WDNR_CAFOs.sindex
 
     # Load EWG AFO location predictions
     ewg_afos = gpd.read_file(
-        data_path / "ewg_AFOs_012022.geojson", driver="GeoJSON"
+        P.ewg_afos, driver="GeoJSON"
     )
     ewg_afos.to_crs(cfg.WI_EPSG, inplace=True)
 
     # Load all CF annotations outside EWG study region
     cf_annotations_exc_EWG = cluster.load_polygons(
-        data_path / "annotations/full_state_cf_annotations.geojson",
+        P.full_state_annotations,
         counties,
         image_bound_map,
     )
 
     # Load all CF annotation clusters statewide
-    all_cf_clusters = cluster.load_clusters(cluster_path / "all_cf_clusters.csv")
+    all_cf_clusters = cluster.load_clusters(P.all_cf_clusters)
     if "animal_unit_estimate" not in all_cf_clusters.columns:
         all_cf_clusters = est_au.sample_and_calc_au(
             all_cf_clusters, include_area_uncertainty=False
@@ -2936,14 +2915,14 @@ def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, m
 
     # Load poultry and inception model detections
     inception_detections = gpd.read_file(
-        model_prediction_path / "inception/inception_dets.geojson"
+        P.inception_dets
     ).to_crs(cfg.WI_EPSG)
     poultry_detections = gpd.read_file(
-        model_prediction_path / "poultry/all_poultry_predictions_confidence_0.1.geojson"
+        P.poultry_dets
     ).to_crs(cfg.WI_EPSG)
 
     # Load pre-created three- and four-band model clusters
-    four_band_clusters = cluster.load_clusters(cluster_path / "four_band_clusters.csv")
+    four_band_clusters = cluster.load_clusters(P.four_band_clusters)
     # remove clusters in EWG study region
     four_band_clusters = amo.label_by_ewg_region(four_band_clusters, counties)
     if "animal_unit_estimate" not in four_band_clusters.columns:
@@ -2951,9 +2930,7 @@ def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, m
     
     four_band_clusters_exc_EWG = four_band_clusters[~four_band_clusters["ewg_region"]]
 
-    three_band_clusters = cluster.load_clusters(
-        cluster_path / "three_band_clusters.csv"
-    )
+    three_band_clusters = cluster.load_clusters(P.three_band_clusters)
     # add county name and remove clusters in EWG study region
     three_band_clusters = amo.label_by_ewg_region(three_band_clusters, counties)
     three_band_clusters_exc_EWG = three_band_clusters[
@@ -2961,13 +2938,13 @@ def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, m
     ]
 
     all_waters = gpd.read_file(
-        data_path / "geospatial/water_data" / "24k_Hydro_Waterbodies_(Open_Water).geojson"
+        P.open_water
     ).to_crs(cfg.WI_EPSG)
     impaired_lakes = gpd.read_file(
-        data_path / "geospatial/water_data" / "impaired_lakes.geojson"
+        P.impaired_lakes
     ).to_crs(cfg.WI_EPSG)
     impaired_rivers_streams = gpd.read_file(
-        data_path / "geospatial/water_data" / "impaired_rivers_streams.geojson"
+        P.impaired_rivers
     ).to_crs(cfg.WI_EPSG)
     impaired_waters = gpd.GeoDataFrame(
         pd.concat([impaired_lakes, impaired_rivers_streams], ignore_index=True)
@@ -2977,14 +2954,15 @@ def load_data(analysis_output_path, data_path, land_parcel_path, cluster_path, m
         impaired_waters["ALL_SOURCES"] == "Non-Point Source (Rural or Urban)"
     ]
     water_table_depth = gpd.read_file(
-        data_path / "geospatial/water_data" / "GCSM_-_Water_Table_Depth.geojson"
+        P.water_table_depth
     ).to_crs(cfg.WI_EPSG)
 
     snapmaps=None
     if read_snapmaps:
-        snapmaps = process_snapmaps.load_snapmaps(feather=snapmaps_feather, feather_dir = data_path / "snapmaps_feather",
-                                                  raw_gdb = data_path / "NM_590_CAFO_STATEWIDE.gdb", crs=cfg.WI_EPSG,
-                                                  simplify_geometries=True, tolerance=10)
+        snapmaps = process_snapmaps.load_snapmaps(
+            feather_dir=P.snapmaps_dir, layers=P.SNAPMAPS_LAYERS, crs=cfg.WI_EPSG,
+            simplify_geometries=True, tolerance=10,
+        )
         
     return image_bound_map, counties, parcels, milk_producers, WDNR_CAFOs, ewg_afos, cf_annotations_exc_EWG, all_cf_clusters, cf_clusters_EWG, cf_clusters_exc_EWG, inception_detections, poultry_detections, four_band_clusters, four_band_clusters_exc_EWG, three_band_clusters, three_band_clusters_exc_EWG, all_waters, impaired_waters, water_table_depth, snapmaps
 
@@ -3769,17 +3747,9 @@ def plot_risk_comparison_examples(all_clusters: gpd.GeoDataFrame,
 
 
 if __name__ == "__main__":
-    # 0. Load paths from config file
-    with open(Path().resolve().parent / "afo_vs_cafo/config/config.yml", "r") as file:
-        configs = yaml.safe_load(file)
-    analysis_output_path = Path(configs["analysis_output_path"])
-    fig_path = Path(configs["fig_path"])
-    data_path = Path(configs["data_path"])
-    land_parcel_path = Path(configs["land_parcel_path"])
-    model_prediction_path = Path(configs["model_prediction_path"])
-    cluster_path = Path(configs["cluster_path"])
-    # Set GCP credentials
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = configs["gcp_cred_path"]
+    # 0. Paths come from config/config_params.py (PATHS registry)
+    fig_path = Path("figures")
+    fig_path.mkdir(exist_ok=True)
     # Prevent matplotlib from opening new windows
     matplotlib.use("Agg")
 
@@ -3787,21 +3757,17 @@ if __name__ == "__main__":
     print("Loading data...")
     
     image_bound_map, counties, parcels, milk_producers, WDNR_CAFOs, ewg_afos, cf_annotations_exc_EWG, all_cf_clusters, cf_clusters_EWG, cf_clusters_exc_EWG, inception_detections, poultry_detections, four_band_clusters, four_band_clusters_exc_EWG, three_band_clusters, three_band_clusters_exc_EWG, all_waters, impaired_waters, water_table_depth, snapmaps = load_data(
-        analysis_output_path,
-        data_path,
-        land_parcel_path,
-        cluster_path,
-        model_prediction_path,
+        cfg.PATHS,
         read_snapmaps=False
     )
 
     ewg_cf_train_labels = cluster.load_polygons(
-        data_path / "Annotations/ewg_region_train_labels.geojson",
+        cfg.PATHS.ewg_region_annotations,
         counties,
         image_bound_map
     )
 
-    all_labeled_images = get_labeled_images(how="json", data_path=data_path)
+    all_labeled_images = get_labeled_images(how="csv")
 
     # Print useful stats about model sending/imagery
     ## Need to add something here about # sent to CF
@@ -3899,12 +3865,12 @@ if __name__ == "__main__":
 )
     
     pixel_level_p_r_IOU_curves(
-        model_prediction_path=model_prediction_path,
+        model_prediction_path=cfg.PATHS.raw_model_predictions,
         vec_thresh=[0.25, 0.4, 0.5,0.6, 0.75],
         CF_polygons=cf_annotations_exc_EWG,
         image_bound_map=image_bound_map,
         counties=counties,
-        stats_path=analysis_output_path / "pixel_level_p_r_IOU_curves_only_annotated_areas.csv",
+        stats_path=cfg.PATHS.reference_dir / "pixel_level_p_r_IOU_curves_only_annotated_areas.csv",
         include_sent_but_no_annot=False,
         recalculate_stats=True,
         save_path=fig_path / "pixel_level_p_r_IOU_curves_only_annotated_areas.png",
@@ -3969,12 +3935,12 @@ if __name__ == "__main__":
     # )
 
     # pixel_level_p_r_IOU_curves(
-    #     model_prediction_path=model_prediction_path,
+    #     model_prediction_path=cfg.PATHS.raw_model_predictions,
     #     vec_thresh=[0.25, 0.4, 0.5, 0.75],
     #     CF_polygons=cf_annotations_exc_EWG,
     #     image_bound_map=image_bound_map,
     #     counties=counties,
-    #     stats_path=analysis_output_path / "pixel_level_p_r_IOU_curves.csv",
+    #     stats_path=cfg.PATHS.pixel_curves,
     #     include_sent_but_no_annot: False,
     #     recalculate_stats=True,
     #     save_path=fig_path / "pixel_level_p_r_IOU_curves.png",
@@ -4000,7 +3966,7 @@ if __name__ == "__main__":
     #     four_band_clusters,
     #     counties,
     #     milk_producers,
-    #     data_path / "water_data" / "DEM_30m" / "WI_slope.tif",
+    #     cfg.PATHS.slope_tif,
     #     all_waters,
     #     impaired_waters,
     #     water_table_depth,
@@ -4017,7 +3983,7 @@ if __name__ == "__main__":
     #     four_band_clusters,
     #     counties,
     #     milk_producers,
-    #     data_path / "water_data" / "DEM_30m" / "WI_slope.tif",
+    #     cfg.PATHS.slope_tif,
     #     all_waters,
     #     impaired_waters,
     #     water_table_depth,
@@ -4034,7 +4000,7 @@ if __name__ == "__main__":
     #     four_band_clusters,
     #     counties,
     #     milk_producers,
-    #     data_path / "water_data" / "DEM_30m" / "WI_slope.tif",
+    #     cfg.PATHS.slope_tif,
     #     all_waters,
     #     impaired_waters,
     #     water_table_depth,

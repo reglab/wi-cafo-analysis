@@ -1,28 +1,17 @@
-# PATHS
-# When starting to use WI-CAFO, create a copy of this file, rename it 'config.yml', and 
-# replace the paths below with the respective directories on your computer.
+# Optional. Copy to config/config.yml (git-ignored) to override the defaults.
+# With no config.yml the pipeline uses ./data as the data root.
+# Every path may be absolute, ~-prefixed, or relative to the repo root.
 
-# project directory
-project_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo
+# Folder holding the Hugging Face dataset download (reglab/wisconsin-dairy-cafo).
+# Populate it with `python download_data.py`. Env override: WI_CAFO_DATA_ROOT
+data_root: data
 
-# directory that contains raw data for analysis
-data_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/data
+# Optional: Wisconsin statewide parcels (WI SCO, V8.0.0) as a geofeather file.
+# Only needed to draw parcel overlays on NAIP imagery figures, or to re-run
+# clustering. Default: <data_root>/land_parcels/WI_parcels.feather
+# parcels_path: /path/to/WI_parcels.feather
 
-# where to save figures
-fig_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/figures
-
-# where to save analysis outputs
-analysis_output_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/analysis_outputs
-
-# where cluster outputs are located
-cluster_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/analysis_outputs/clusters
-
-# where land parcel data is located
-land_parcel_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/data/land_parcels
-
-# where model prediction polygons are located
-model_prediction_path: /Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/data/model_predictions
-
-# Path to GCP credentials file. For more information on creating a credentials file linked to your google
-# account, see https://cloud.google.com/docs/authentication/provide-credentials-adc.
-gcp_cred_path: '/Users/rtreves/Documents/RegLab/projects/afo_vs_cafo/config/law-cafo-b8d0ee1e9422.json'
+# Optional: GCP service-account key for NAIP imagery figures
+# (skip with `generate_paper_results.py --skip-imagery`).
+# See https://cloud.google.com/docs/authentication/provide-credentials-adc
+# gcp_cred_path: /path/to/gcp-key.json

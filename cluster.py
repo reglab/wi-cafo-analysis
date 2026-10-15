@@ -659,22 +659,18 @@ def cluster(
 
 if __name__ == "__main__":
     # 0. Load paths from config file
-    with open(Path().resolve().parent / "afo_vs_cafo/config/config.yml", "r") as file:
-        configs = yaml.safe_load(file)
-    data_path = Path(configs["data_path"])
-    land_parcel_path = Path(configs['land_parcel_path'])
-    cluster_path = Path(configs['cluster_path'])
-    analysis_output_path = Path(configs['analysis_output_path'])
+    import config.config_params as cfg
+    P = cfg.PATHS
 
     # 1. Load and clean data
     print("LOADING DATA...")
-    counties = gpd.read_file(data_path / 'County_Boundaries_24K/County_Boundaries_24K.shp')
-    image_bound_map = gpd.read_file(analysis_output_path / 'image_bound_map.geojson')
-    parcels = load_parcels(land_parcel_path / 'WI_parcels.feather', feather=True)
+    counties = gpd.read_file(P.county_boundaries)
+    image_bound_map = gpd.read_file(P.image_bound_map)
+    parcels = load_parcels(P.parcels, feather=True)
 
-    outside_ewg_annotations = load_polygons(data_path / 'Annotations/full_state_cf_annotations.geojson',
+    outside_ewg_annotations = load_polygons(P.full_state_annotations,
                                             counties, image_bound_map)
-    inside_ewg_annotations = load_polygons(data_path / 'Annotations/ewg_region_train_labels.geojson',
+    inside_ewg_annotations = load_polygons(P.ewg_region_annotations,
                                             counties, image_bound_map)
     all_annotations = pd.concat([outside_ewg_annotations, inside_ewg_annotations], axis=0)
     all_annotations['polygon_index'] = range(0, all_annotations.shape[0])
@@ -686,7 +682,7 @@ if __name__ == "__main__":
 
 
     # # 3. Save to disk
-    # save_clusters(all_cf_annotation_clusters, "all_CF_clusters.csv", cluster_path)
+    # save_clusters(all_cf_annotation_clusters, "all_cf_clusters.csv", P.clusters_dir)
 
 
     # 4. Run clustering for model predictions + different vectorization thresholds - this takes forever to run, need to fix

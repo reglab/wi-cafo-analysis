@@ -7,63 +7,64 @@ Analysis code for detecting and characterizing dairy Concentrated Animal Feeding
 - How well can we predict dairy cattle herd size using barn footprint predictions?
 - Can we use these results to identify potentially unpermitted dairy CAFOs?
 
-## Data
-
-All data required to reproduce the paper results are available on Hugging Face at [reglab/wisconsin-dairy-cafo](https://huggingface.co/datasets/reglab/wisconsin-dairy-cafo).
-
-Model weights and training/inference code are available in the [cafo-segmentation](https://github.com/reglab/cafo-segmentation) repository.
-
-## Setup
-
-**Requirements:** Python 3.11
-
-1. Clone this repository.
-
-2. Copy `config/config_example.yml` to `config/config.yml` and update each path to match your local filesystem.
-
-3. Download the data from [reglab/wisconsin-dairy-cafo](https://huggingface.co/datasets/reglab/wisconsin-dairy-cafo) (see below for directory structure).
-
-4. Create a virtual environment and install dependencies:
+## Quick start
 
 ```bash
+git clone https://github.com/reglab/wi-cafo-analysis && cd wi-cafo-analysis
+
 uv venv --python 3.11 wicafo
 uv pip install -r requirements.txt --python wicafo/bin/python3.11
 source wicafo/bin/activate
+
+python download_data.py                         # fetch inputs from Hugging Face into ./data (~4 GB)
+python generate_paper_results.py --skip-imagery
 ```
 
-Any environment manager targeting Python 3.11 works; replace the `uv` commands with your preferred tool.
+Requires Python 3.11 (any environment manager works). `python check_data.py` lists any missing input files.
 
-## Expected data directory layout
+## Data
 
-After downloading from Hugging Face, your `data/` and `analysis_outputs/` directories should look like:
+All inputs live under one **data root**, and every file location is derived from it. Set it with
+`data_root` in `config/config.yml` (copy `config/config_example.yml`) or the `WI_CAFO_DATA_ROOT`
+environment variable. The default is `./data`, so no config is needed if you download there.
+`config.yml` has two other optional settings: `gcp_cred_path` (NAIP imagery figures) and
+`parcels_path` (see below). Every path is declared once, in `DataPaths` in
+[config/config_params.py](config/config_params.py), next to the analysis constants.
+
+Data comes from three places:
+
+| Where | What | How you get it |
+|---|---|---|
+| [Hugging Face: reglab/wisconsin-dairy-cafo](https://huggingface.co/datasets/reglab/wisconsin-dairy-cafo) | Everything large: annotations, clusters, permits, water, SNAPMAPS layers, slope raster, urban areas, image bounds | `python download_data.py` |
+| `reference_data/` in this repo | Small cached tables: pixel-level P/R/IOU curves, Census ACS county covariates, Aug 2024 WDNR permit shapefiles | `git clone` |
+| `manual_review/` in this repo | Human-judgment columns from the manual false-positive review and online validation | `git clone` |
+
+Layout of the data root after `download_data.py`. It is the same tree as the Hugging Face repo, whose
+dataset card describes every file:
 
 ```
 data/
-├── Annotations/
-│   ├── full_state_cf_annotations.geojson
-│   └── ewg_region_train_labels.geojson
-├── WDNR_permitted_CAFOs/
-│   └── WDNR_CAFOs.geojson
-├── ewg_AFOs_012022.geojson
-├── permit_animal_type_records_*.csv
-├── milk_producers.geojson
-├── County_Boundaries_24K/
-├── WI_urban_areas/
-└── water_data/
-
-analysis_outputs/
-└── Clusters/
-    ├── all_CF_clusters.csv
-    ├── all_cf_clusters.geojson
-    ├── four_band_clusters.csv
-    ├── three_band_clusters.csv
-    └── hyper_parameter_best_model_clusters.csv
+├── wi_cafo_facilities.{geojson,parquet,csv}     # published facility dataset
+└── input_data/
+    ├── WDNR_CAFOs.geojson, ewg_AFOs_012022.geojson, milk_producers.geojson
+    ├── permit_animal_type_records.csv
+    ├── annotations/         full_state_cf_annotations.geojson, ewg_region_train_labels.geojson, all_labeled_images.csv
+    ├── clusters/            all_cf_clusters.csv, four_band_clusters.csv, three_band_clusters.csv
+    ├── model_predictions/   inception_dets.geojson, poultry_dets_confidence_0.1.geojson
+    └── geospatial/
+        ├── image_bound_map.geojson
+        ├── county_boundaries/, urban_areas/, dem/WI_slope.tif
+        ├── water_data/
+        └── snapmaps/        12 SNAPMAPS layers as .feather
 ```
 
-Large ancillary datasets not included in the HF repository:
-- **Wisconsin land parcels** (V8.0.0): [WI SCO](https://www.sco.wisc.edu/parcels/data/)
-- **NAIP imagery**: stored on Google Cloud (GCP credentials required; contact the authors)
-- **SNAPMAPs nutrient management layers**: [DATCP open data portal](https://gis-widatcp.opendata.arcgis.com/datasets/47ff7f962ad8415aa82938e9df392f21/about)
+Not hosted, and not required for `generate_paper_results.py`:
+- **Wisconsin land parcels** (V8.0.0, [WI SCO](https://www.sco.wisc.edu/parcels/data/)): only used for parcel overlays on imagery figures and for re-running `cluster.py`. Set `parcels_path` in `config.yml` if you have them.
+- **NAIP imagery** (GCS, credentials required; contact the authors): needed for the case-study imagery figures. Use `--skip-imagery` otherwise.
+- **Raw model prediction polygons** (~9 GB, see [cafo-segmentation](https://github.com/reglab/cafo-segmentation)): only for `--recalculate-pixel-stats`; place them under `<data_root>/raw_model_predictions/`.
+- **Raw SNAPMAPS geodatabase and 30 m DEM**: only to re-derive `snapmaps/*.feather` (`python process_snapmaps.py <gdb>`) and `WI_slope.tif` (`cluster_analysis_functions.calculate_slope_from_dem`).
+
+Model weights and training/inference code are in [cafo-segmentation](https://github.com/reglab/cafo-segmentation).
 
 ## Reproducing paper results
 
@@ -106,8 +107,10 @@ python generate_paper_results.py --skip-imagery       # skip NAIP tile case-stud
 | `process_snapmaps.py` | Load/process SNAPMAPs geodatabase layers |
 | `naip_utils.py` | NAIP imagery utilities (requires GCP credentials) |
 | `add_asym.py` | Asymmetric uncertainty calculations |
-| `config/config_params.py` | Global constants (EPSG codes, AU factors, figure styling) |
-| `config/config_example.yml` | Configuration template — copy to `config.yml` and edit paths |
+| `config/config_params.py` | Single config module: input-file paths (`PATHS`) plus global constants (EPSG codes, AU factors, figure styling) |
+| `config/config_example.yml` | Optional overrides (data root, GCP key, parcels) — copy to `config.yml` |
+| `download_data.py` / `check_data.py` | Fetch inputs from Hugging Face / report missing files |
+| `scripts/stage_hf_upload.py` | Maintainers: assemble the Hugging Face upload tree from a local data folder |
 
 ## Citation
 

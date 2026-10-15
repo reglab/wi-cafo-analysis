@@ -34,7 +34,7 @@ def section_intro(paths, subdirs):
     m["NumIntroCowsPerAU"] = str(round(1000 / cfg.MILKING_AND_DRY_COWS_AU_FACTOR))
     m["NumIntroPermittedCafoCount"] = str(int(summary_pe.loc["n_clusters", "Permitted dairy CAFOs"]))
 
-    with open(paths["data_path"] / "ewg_AFOs_012022.geojson") as f:
+    with open(paths.ewg_afos) as f:
         ewg = json.load(f)
     m["NumIntroEwgFarmCount"] = f"{len(ewg['features']):,}"
     m["NumIntroEwgCountyCount"] = "nine"
@@ -42,7 +42,7 @@ def section_intro(paths, subdirs):
         1 for feat in ewg["features"] if feat["properties"].get("Permitted") == "Yes"
     ))
 
-    with open(paths["data_path"] / "annotations/ewg_region_train_labels.geojson") as f:
+    with open(paths.ewg_region_annotations) as f:
         annotations = json.load(f)
     m["NumIntroBarnAnnotationCount"] = f"{len(annotations['features']):,}"
 

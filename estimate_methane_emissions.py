@@ -150,10 +150,8 @@ if __name__ == "__main__":
     """
     """
     # Find paths from config
-    with open(Path().resolve().parent / 'afo_vs_cafo/config/config.yml', 'r') as file:
-        configs = yaml.safe_load(file)
-    cluster_path = Path(configs['cluster_path'])
-    data_path = Path(configs['data_path'])
+    import config.config_params as cfg
+    cluster_path = cfg.PATHS.clusters_dir
 
     # Load and preprocess model cluster file
     four_band_clusters = cluster.load_clusters(cluster_path / "four_band_clusters.csv")
@@ -175,7 +173,7 @@ if __name__ == "__main__":
     # Estimate combined emissions from unpermitted dairy cattle in WI
     
     # Load known CAFO locations
-    WDNR_CAFOs = gpd.read_file(data_path / "WDNR_CAFOs.geojson", driver="GeoJSON")
+    WDNR_CAFOs = gpd.read_file(cfg.PATHS.wdnr_cafos, driver="GeoJSON")
     # Match model clusters to CAFO permits 
     matched_model_clusters, err = caf.merge_clusters_permits(
         four_band_clusters,

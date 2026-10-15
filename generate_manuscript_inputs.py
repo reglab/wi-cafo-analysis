@@ -64,6 +64,12 @@ def copy_manuscript_figures(paper_results_dir=Path("paper_results")):
     falling back to revised_manuscript/ for imagery-dependent/static figures.
     """
     MANUSCRIPT_INPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    if not MAIN_TEX_PATH.exists():
+        # revised_manuscript/ is not part of the public repo; figures are
+        # still available in paper_results/ for anyone assembling their own.
+        print(f"  {MAIN_TEX_PATH} not found; skipping manuscript figure copy "
+              "(figures remain in paper_results/).")
+        return {"fresh": 0, "fallback": 0, "missing": 0}
     refs = _figure_references(MAIN_TEX_PATH)
 
     n_fresh, n_fallback, n_missing = 0, 0, 0

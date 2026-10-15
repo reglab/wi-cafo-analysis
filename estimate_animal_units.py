@@ -77,11 +77,12 @@ def prep_permit_data(data_path, use_only_dairy_permits=True):
 
     return permit_data
 
-def prep_model_error_data(cluster_path = Path(cfg.cluster_path),
-                          annotated_ims_path = Path(cfg.data_path + "/data/Annotations/all_labeled_images.csv"),
+def prep_model_error_data(cluster_path = cfg.PATHS.clusters_dir,
+                          annotated_ims_path = cfg.PATHS.all_labeled_images,
                           size_bins = cfg.size_bins,
                           model_type = "four_band",
                           how='left'):
+    cluster_path = Path(cluster_path)
     all_cf_clusters = cluster.load_clusters(cluster_path / "all_cf_clusters.csv")
     three_band_clusters = cluster.load_clusters(
             cluster_path / "three_band_clusters.csv"
@@ -188,7 +189,7 @@ def sample_and_calc_au(
         for key, params in cfg.truncnorm_params.items()
     }
     if permit_data is None:
-        permit_data = prep_permit_data(cfg.animal_count_permit_data_path, use_only_dairy_permits)
+        permit_data = prep_permit_data(cfg.PATHS.permit_animal_records, use_only_dairy_permits)
         print(f"Permit data loaded, length={len(permit_data)}")
         # check that there are no missing values or 0 values
         if (permit_data['Total cattle'].isna().any()) or ((permit_data['Total cattle'] == 0).any()):
@@ -211,8 +212,8 @@ def sample_and_calc_au(
     cluster_data["Dairy_count_estimate_upper"] = 0
     
     # Get error data
-    error_data = prep_model_error_data(cluster_path = Path(cfg.cluster_path),   
-                          annotated_ims_path = Path(cfg.data_path + "/annotations/all_labeled_images.csv"),
+    error_data = prep_model_error_data(cluster_path = cfg.PATHS.clusters_dir,
+                          annotated_ims_path = cfg.PATHS.all_labeled_images,
                           size_bins = size_bins,
                           model_type = model_type,
                           how=model_error_join)
@@ -477,10 +478,7 @@ def propagate_stdevs(stdev_list: list, mean_list: list):
 
 if __name__ == '__main__':
 
-    with open("config/config.yml", "r") as file:
-        configs = yaml.safe_load(file)
-    
-    cluster_path = Path(configs["cluster_path"])
+    cluster_path = cfg.PATHS.clusters_dir
 
     #  Load all CF annotation clusters statewide
     all_cf_clusters = cluster.load_clusters(cluster_path / "all_cf_clusters.csv")

@@ -402,18 +402,13 @@ def _plot_or_forest(model, save_path):
 
 if __name__ == "__main__":
     # Standalone quick-test against the publication dataset.
-    import yaml
-
-    with open("config/config.yml") as f:
-        configs = yaml.safe_load(f)
-    data_path = Path(configs["data_path"])
+    import config.config_params as cfg
+    P = cfg.PATHS
 
     pub = gpd.read_parquet(
         "paper_results/publication_dataset/wi_cafo_facilities.parquet"
     )
-    counties = gpd.read_file(
-        data_path / "geospatial/county_boundaries/County_Boundaries_24K.shp"
-    )
+    counties = gpd.read_file(P.county_boundaries)
     out_tables = Path("paper_results/tables")
     out_fig = Path("paper_results/04_unpermitted_analysis")
     out_tables.mkdir(parents=True, exist_ok=True)
@@ -423,7 +418,7 @@ if __name__ == "__main__":
         pub, counties,
         save_table_path=out_tables / "permit_status_regression.csv",
         save_fig_path=out_fig / "permit_status_or_forest.svg",
-        census_cache_path=data_path / "census_acs_county.csv",
+        census_cache_path=P.census_acs_county,
     )
     print("\n=== Tidy odds-ratio table (primary models) ===")
     show = res["tidy"][~res["tidy"]["term"].str.startswith("C(")]

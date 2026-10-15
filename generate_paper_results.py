@@ -80,24 +80,25 @@ def apply_paper_style():
 # merging its own fresh computation with these checked-in review snapshots —
 # to refresh a snapshot, re-download the relevant sheet tab and overwrite the
 # matching file here.
-MANUAL_REVIEW_DIR = Path("manual_review")
+MANUAL_REVIEW_DIR = cfg.PATHS.manual_review_dir
 
 
-def setup_paths():
-    """Load config and create output directory structure."""
-    with open("config/config.yml", "r") as f:
-        configs = yaml.safe_load(f)
+def setup_paths(skip_snapmaps=False):
+    """Check that all input data is present and create the output directory structure.
 
-    paths = {
-        "analysis_output_path": Path(configs["analysis_output_path"]),
-        "data_path": Path(configs["data_path"]),
-        "land_parcel_path": Path(configs["land_parcel_path"]),
-        "model_prediction_path": Path(configs["model_prediction_path"]),
-        "cluster_path": Path(configs["cluster_path"]),
-        "fig_path": Path(configs["fig_path"]),
-    }
+    All input locations come from cfg.PATHS (config/config_params.py), which is
+    rooted at a single data folder (see README, "Data").
+    """
+    paths = cfg.PATHS
 
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = configs["gcp_cred_path"]
+    missing = paths.missing_files(skip_snapmaps=skip_snapmaps)
+    if missing:
+        sys.exit(
+            f"Missing {len(missing)} input file(s) under {paths.data_root}:\n  "
+            + "\n  ".join(str(m.relative_to(paths.repo_root) if paths.repo_root in m.parents else m) for m in missing)
+            + "\n\nRun `python download_data.py` to fetch them from Hugging Face "
+              "(or `python check_data.py` for details)."
+        )
 
     output_base = Path("paper_results")
     subdirs = {
@@ -132,14 +133,7 @@ def load_all_data(paths, read_snapmaps=True):
         four_band_clusters, four_band_clusters_exc_EWG, three_band_clusters,
         three_band_clusters_exc_EWG, all_waters, impaired_waters,
         water_table_depth, snapmaps,
-    ) = cf.load_data(
-        paths["analysis_output_path"],
-        paths["data_path"],
-        paths["land_parcel_path"],
-        paths["cluster_path"],
-        paths["model_prediction_path"],
-        read_snapmaps=read_snapmaps,
-    )
+    ) = cf.load_data(paths, read_snapmaps=read_snapmaps)
 
     # Compute AU estimates if needed
     if "animal_unit_estimate" not in all_cf_clusters.columns:
@@ -281,18 +275,19 @@ def generate_regional_robustness_analysis(data, permit_matched, subdirs):
 # ============================================================================
 
 def generate_segmentation_quality(data, paths, subdirs,
-                                  recalculate_pixel_stats=False):
+                                  recalculate_pixel_stats=False,
+                                  skip_imagery=False):
     """Pixel P/R/IOU, annotation errors, examples. 3 figures → 02_segmentation_quality/."""
     out = subdirs["segmentation"]
 
     # Pixel-level P/R/IOU curves
     cf.pixel_level_p_r_IOU_curves(
-        model_prediction_path=paths["model_prediction_path"],
+        model_prediction_path=paths.raw_model_predictions,
         vec_thresh=np.array([0.25, 0.4, 0.5, 0.6, 0.75]),
         CF_polygons=data["cf_annotations_exc_EWG"],
         image_bound_map=data["image_bound_map"],
         counties=data["counties"],
-        stats_path=paths["analysis_output_path"] / "pixel_level_p_r_IOU_curves.csv",
+        stats_path=paths.pixel_curves,
         recalculate_stats=recalculate_pixel_stats,
         models=["four_band"],
         save_path=out / "pixel_level_p_r_IOU_curves.png",
@@ -319,7 +314,9 @@ def generate_segmentation_quality(data, paths, subdirs,
             lambda x: "WI_Brown_2_7168_12288.jpeg" in x
         )
     ]
-    if len(cf_cluster) > 0 and len(four_band_cluster) > 0:
+    if skip_imagery:
+        print("  Skipping annotation_prediction_examples (needs NAIP imagery).")
+    elif len(cf_cluster) > 0 and len(four_band_cluster) > 0:
         cf.annotation_prediction_examples(
             cf_cluster, four_band_cluster,
             save_path=out / "annotation_prediction_examples.svg",
@@ -393,13 +390,11 @@ def generate_error_analysis(data, paths, subdirs, skip_imagery=False):
 # ============================================================================
 
 # Wisconsin has no dedicated Census "Urban Area" (uac) layer in the TIGER
-# extract we have on hand (data/WI_urban_areas is a bulk per-county dump with
-# no uac file, and the statewide tabblock20 file's UR20/UACE20 urban-flag
-# fields are unpopulated in this extract). tl_2020_55_place20.shp
-# (incorporated cities/villages) is the closest deterministic, statewide
-# proxy for "urban area" and is what the >500m urban-proximity filter uses
-# below and in generate_ewg_fp_waterfall().
-URBAN_AREA_PROXY_PATH = "WI_urban_areas/tl_2020_55_place20.shp"
+# extract used here, and the statewide tabblock20 file's UR20/UACE20 urban-flag
+# fields are unpopulated. tl_2020_55_place20.shp (incorporated cities/villages,
+# Census TIGER/Line 2020) is the closest deterministic, statewide proxy for
+# "urban area" and is what the >500m urban-proximity filter uses below and in
+# generate_ewg_fp_waterfall(). Location: cfg.PATHS.urban_areas.
 
 
 def _add_cf_review_flags(four_band_clusters, all_cf_clusters, paths):
@@ -413,7 +408,7 @@ def _add_cf_review_flags(four_band_clusters, all_cf_clusters, paths):
     """
     four_band = four_band_clusters.copy()
 
-    all_labeled_images = cf.get_labeled_images(how="csv", data_path=paths["data_path"])
+    all_labeled_images = cf.get_labeled_images(how="csv", csv_path=paths.all_labeled_images)
     labeled_set = set(all_labeled_images["Image name"].tolist())
     four_band["any_images_sent"] = four_band["jpeg_names"].apply(
         lambda x: any(item in labeled_set for item in (x if isinstance(x, (list, tuple)) else []))
@@ -455,7 +450,7 @@ def generate_image_review_stats(data, paths, subdirs):
     # ------------------------------------------------------------------
     # 3. Urban area filter: keep clusters >500m from any urban area
     # ------------------------------------------------------------------
-    urban_areas_path = paths["data_path"].parent / URBAN_AREA_PROXY_PATH
+    urban_areas_path = paths.urban_areas
     four_band = four_band.drop(columns=["index_right"], errors="ignore")
     try:
         urban_areas = gpd.read_file(urban_areas_path).to_crs(cfg.WI_EPSG)
@@ -569,7 +564,7 @@ def generate_human_annotation_yield_stats(data, paths, subdirs):
     n0 = len(fb)
 
     urban_areas = gpd.read_file(
-        paths["data_path"].parent / URBAN_AREA_PROXY_PATH
+        paths.urban_areas
     ).to_crs(cfg.WI_EPSG)
     fb = fb.sjoin_nearest(urban_areas[["geometry"]], distance_col="dist_to_urban")
     fb = fb[~fb.index.duplicated(keep="first")]
@@ -712,7 +707,7 @@ def generate_ewg_fp_waterfall(data, paths, subdirs):
     before = len(remaining)
     try:
         urban_areas = gpd.read_file(
-            paths["data_path"].parent / URBAN_AREA_PROXY_PATH
+            paths.urban_areas
         ).to_crs(cfg.WI_EPSG)
         remaining = remaining.sjoin_nearest(
             urban_areas[["geometry"]], distance_col="dist_to_urban"
@@ -1593,7 +1588,7 @@ def generate_permit_status_regression(data, all_clusters, paths, subdirs):
     Census/ACS county socioeconomic controls when a CENSUS_API_KEY is set (or a
     cached ACS file exists). → tables/ + 04_unpermitted_analysis/.
     """
-    census_cache = paths["data_path"] / "census_acs_county.csv"
+    census_cache = paths.census_acs_county
     res = psr.run_permit_status_regression(
         all_clusters,
         data["counties"],
@@ -1678,8 +1673,8 @@ def generate_risk_assessment(data, paths, subdirs, skip_imagery=False,
             print("  Loading snapmaps...")
             snapmaps = process_snapmaps.load_snapmaps(
                 feather=True,
-                feather_dir=paths["data_path"] / "snapmaps_feather",
-                raw_gdb=paths["data_path"] / "NM_590_CAFO_STATEWIDE.gdb",
+                feather_dir=paths.snapmaps_dir,
+                layers=paths.SNAPMAPS_LAYERS,
                 crs=cfg.WI_EPSG,
                 simplify_geometries=True, tolerance=10,
             )
@@ -1699,7 +1694,7 @@ def generate_risk_assessment(data, paths, subdirs, skip_imagery=False,
             data["four_band_clusters"],
             data["counties"],
             data["milk_producers"],
-            paths["data_path"] / "water_data" / "DEM_30m" / "WI_slope.tif",
+            paths.slope_tif,
             data["all_waters"],
             data["impaired_waters"],
             data["water_table_depth"],
@@ -2263,7 +2258,6 @@ def generate_milk_license_match_stats(data, subdirs):
 # Section 11c: 2024 permit update match (out-of-sample confirmation)
 # ============================================================================
 
-PERMIT_2024_DIR_NAME = "wdnr_cafos_2024_aug"
 PERMIT_2024_MATCH_DISTANCE = 400  # metres — matches caf.merge_clusters_permits elsewhere
 
 
@@ -2278,7 +2272,7 @@ def _load_permits_2024(paths):
         SATELLITE_ column (null for main sites), matching data["WDNR_CAFOs"]'s
         schema closely enough to reuse the same matching logic.
     """
-    permit_dir = paths["data_path"] / PERMIT_2024_DIR_NAME
+    permit_dir = paths.wdnr_2024_dir
     new_main = gpd.read_file(permit_dir / "CAFO Main.shp")
     new_sat = gpd.read_file(permit_dir / "CAFO Satellite.shp")
 
@@ -2782,7 +2776,9 @@ def main():
     start = time.time()
 
     # Setup
-    paths, subdirs = setup_paths()
+    paths, subdirs = setup_paths(
+        skip_snapmaps=args.skip_snapmaps or args.use_precomputed
+    )
 
     # Open log file — tee all stdout to it for the rest of the run
     log_path = Path("paper_results") / "paper_results.log"
@@ -2847,6 +2843,7 @@ def _run_pipeline(args, paths, subdirs, recalc_pixel):
     print("\n=== 2/8: Segmentation Quality ===")
     generate_segmentation_quality(
         data, paths, subdirs, recalculate_pixel_stats=recalc_pixel,
+        skip_imagery=args.skip_imagery,
     )
 
     # 3. Error analysis

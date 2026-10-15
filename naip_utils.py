@@ -6,7 +6,7 @@ from google.cloud import storage
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from pathlib import Path
-import yaml
+import config.config_params as cfg
 from tqdm import tqdm
 from shapely import Polygon
 from shapely.geometry import box
@@ -15,6 +15,18 @@ import pandas as pd
 import json
 from datetime import datetime
 from multiprocessing import Pool
+
+
+
+def _require_gcp_credentials():
+    """NAIP tiles live in a private GCS bucket; credentials are set via
+    gcp_cred_path in config/config.yml or GOOGLE_APPLICATION_CREDENTIALS."""
+    if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+        raise RuntimeError(
+            "GCP credentials not configured. Set `gcp_cred_path` in "
+            "config/config.yml or the GOOGLE_APPLICATION_CREDENTIALS env var "
+            "(or run with --skip-imagery)."
+        )
 
 
 def collect_neighboring_tiles(filename_list, tilesize=1024):
@@ -123,10 +135,7 @@ def download_transform(filename_list: list,
         rasterio MemoryFile containing the downloaded and transformed .tif.
     """
     # If GCP credentials are not loaded yet, reload them
-    if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
-        with open(Path().resolve().parent / "config/config.yml", "r") as file:
-            configs = yaml.safe_load(file)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = configs["gcp_cred_path"]
+    _require_gcp_credentials()
     # Handle cases with a single filename not in list format
     if type(filename_list) == str:
         filename_list = [filename_list]
@@ -430,10 +439,7 @@ def georeference_cf_annotations(annotations_path: str,
     file_names = [i for i in file_names if i not in ['legend.json', '.DS_Store']]
 
     # If GCP credentials are not loaded yet, reload them
-    if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
-        with open(Path().resolve().parent / "config/config.yml", "r") as file:
-            configs = yaml.safe_load(file)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = configs["gcp_cred_path"]
+    _require_gcp_credentials()
     
     progress = tqdm(file_names)
 
@@ -505,18 +511,14 @@ def georeference_cf_annotations(annotations_path: str,
 
 
 if __name__ == "__main__":
-    with open(Path().resolve().parent / "afo_vs_cafo/config/config.yml", "r") as file:
-        configs = yaml.safe_load(file)
-    analysis_output_path = Path(configs["analysis_output_path"])
-    data_path = Path(configs['data_path'])
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = configs["gcp_cred_path"]
+    # Rebuild input_data/geospatial/image_bound_map.geojson (needs GCP access)
+    _require_gcp_credentials()
+    P = cfg.PATHS
 
     # Load county boundary shapefile for determining masked tiles
-    counties = gpd.read_file(data_path / 'County_Boundaries_24K/County_Boundaries_24K.shp')
+    counties = gpd.read_file(P.county_boundaries)
     counties['COUNTY_NAM'] = counties['COUNTY_NAM'].apply(lambda x: 'St. Croix' if x == 'Saint Croix' else x)
 
     image_bound_map = create_image_bound_map(counties)
-    
-    image_bound_map.to_file(
-        analysis_output_path / "image_bound_map.geojson", driver="GeoJSON"
-    )
+
+    image_bound_map.to_file(P.image_bound_map, driver="GeoJSON")

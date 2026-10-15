@@ -18,5 +18,6 @@ CLAUDE.md
 manuscript_inputs/
 revised_manuscript/
 notebooks/
-manual_review/
 
+hf_upload_staging/
+figure_previews/
